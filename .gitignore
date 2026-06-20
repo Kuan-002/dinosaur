@@ -1,0 +1,19 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# OS files
+.DS_Store
+
+# Logs
+*.log
+
+# Training outputs
+checkpoints/
+previews/
+
+# Datasets
+VOC2012_train_val/
+VOC2012_test/
+datasets/
+data/
