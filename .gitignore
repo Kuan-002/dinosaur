@@ -7,13 +7,22 @@ __pycache__/
 
 # Logs
 *.log
+logs/
+
+# Local environments and caches
+.venv/
+.cache/
 
 # Training outputs
 checkpoints/
 previews/
 
 # Datasets
+dataset/
 VOC2012_train_val/
 VOC2012_test/
 datasets/
 data/
+
+doc/
+analysis/

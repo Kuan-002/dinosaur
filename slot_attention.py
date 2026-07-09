@@ -13,11 +13,13 @@ class SlotAttention(nn.Module):
         slot_dim: int,
         hidden_dim: int,
         routing_iters: int = 3,
+        topk_patches: Optional[int] = None,
     ):
         super().__init__()
         self.num_slots = num_slots
         self.slot_dim = slot_dim
         self.routing_iters = routing_iters
+        self.topk_patches = topk_patches
 
         self.norm_inputs = nn.LayerNorm(input_dim)
         self.W_q = nn.Parameter(torch.empty(slot_dim, slot_dim))
@@ -70,7 +72,12 @@ class SlotAttention(nn.Module):
             # (b, k, n)
             agreement = torch.einsum("bkd,bnd->bkn", q, k)
             attn = agreement.softmax(dim=1) + 1e-8
-            _attn = attn / attn.sum(dim=-1, keepdim=True)  # weighted mean
+            if self.topk_patches is not None and self.topk_patches > 0:
+                topk = min(self.topk_patches, attn.shape[-1])
+                topk_vals, topk_idx = attn.topk(topk, dim=-1)
+                sparse_attn = torch.zeros_like(attn)
+                attn = sparse_attn.scatter(-1, topk_idx, topk_vals)
+            _attn = attn / attn.sum(dim=-1, keepdim=True).clamp_min(1e-8)  # weighted mean
             # (b, k, d)
             slots = torch.einsum("bkn,bnd->bkd", _attn, v)
             # (b*k, d)

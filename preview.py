@@ -46,11 +46,16 @@ def load_model(ckpt_path: str, device: torch.device):
     ckpt_args: Dict = ckpt["args"]
     model = SlotAutoencoder(
         embed_shape=(ckpt_args["num_patches"], ckpt_args["embed_dim"]),
+        decoder_type=ckpt_args.get("model_class", "mlp"),
         hidden_dim=ckpt_args["hidden_dim"],
+        num_blocks=ckpt_args.get("num_blocks", 6),
+        num_heads=ckpt_args.get("num_heads", 6),
+        dropout=ckpt_args.get("dropout", 0.0),
         num_slots=ckpt_args["num_slots"],
         slot_dim=ckpt_args["slot_dim"],
         num_slot_heads=ckpt_args["num_slot_heads"],
         routing_iters=ckpt_args["routing_iters"],
+        sa_topk_patches=int(ckpt_args.get("sa_topk_patches", 0)),
         probabilistic=False,
         proj_cov=ckpt_args["proj_cov"],
     )

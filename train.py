@@ -3,7 +3,6 @@ from typing import TypedDict, Optional, Tuple, Dict, List
 import os
 import sys
 import time
-import wandb
 import numpy as np
 import torch
 import torch.nn as nn
@@ -12,9 +11,20 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from models import SlotAutoencoder
-from datasets import get_pascalVOC
+from datasets import get_coco, get_coco_rules, get_pascalVOC
 from misc_utils import seed_all, EMA
 from ocl_metrics import UnsupervisedMaskIoUMetric
+
+
+class NoOpLogger:
+    def init(self, **kwargs):
+        print("wandb disabled")
+
+    def log(self, metrics):
+        return None
+
+
+wandb = NoOpLogger()
 
 
 def preprocess_batch(
@@ -140,6 +150,12 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument("--cache", action="store_true", default=False)
+    parser.add_argument(
+        "--subset_csv",
+        type=str,
+        default="",
+        help="Balanced subset CSV for --dataset coco_rules.",
+    )
     _nw_help = (
         "DataLoader workers. On Windows, multi-worker loading often fails with shared "
         "memory errors (e.g. 1455); default is 0 there, 8 on Linux/macOS."
@@ -155,7 +171,12 @@ if __name__ == "__main__":
     parser.add_argument("--num_patches", type=int, default=196)
     parser.add_argument("--embed_dim", type=int, default=768)
     # model
-    parser.add_argument("--model_class", type=str, default="mlp")
+    parser.add_argument(
+        "--model_class",
+        type=str,
+        default="mlp",
+        choices=["mlp", "transformer"],
+    )
     parser.add_argument("--hidden_dim", type=int, default=2048)
     parser.add_argument("--num_blocks", type=int, default=6)
     parser.add_argument("--num_heads", type=int, default=6)
@@ -164,6 +185,12 @@ if __name__ == "__main__":
     parser.add_argument("--slot_dim", type=int, default=256)
     parser.add_argument("--num_slot_heads", type=int, default=1)
     parser.add_argument("--routing_iters", type=int, default=3)
+    parser.add_argument(
+        "--sa_topk_patches",
+        type=int,
+        default=0,
+        help="If >0, each slot only aggregates its top-k patch tokens in Slot Attention.",
+    )
     parser.add_argument("--proj_cov", action="store_true", default=False)
     # training
     parser.add_argument("--exp_name", type=str, default="default")
@@ -176,6 +203,36 @@ if __name__ == "__main__":
     parser.add_argument("--wd", type=float, default=1e-6)
     parser.add_argument("--ema_rate", type=float, default=0.999)
     parser.add_argument("--eval_freq", type=int, default=4)
+    parser.add_argument(
+        "--monitor_metric",
+        type=str,
+        default="mBO_i_slots",
+        help="Validation metric used for model selection and early stopping.",
+    )
+    parser.add_argument(
+        "--early_stop_patience",
+        type=int,
+        default=0,
+        help="Stop after this many validation runs without monitor improvement. 0 disables it.",
+    )
+    parser.add_argument(
+        "--early_stop_min_delta",
+        type=float,
+        default=0.0,
+        help="Minimum monitor improvement required to reset early-stop patience.",
+    )
+    parser.add_argument(
+        "--collapse_drop_fraction",
+        type=float,
+        default=0.0,
+        help="Stop if monitor drops this fraction below its best value. 0 disables it.",
+    )
+    parser.add_argument(
+        "--early_stop_min_evals",
+        type=int,
+        default=3,
+        help="Minimum validation runs before collapse or patience stopping can trigger.",
+    )
     parser.add_argument("--determ", action="store_true", default=False)
     parser.add_argument(
         "--wandb_entity",
@@ -186,11 +243,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--wandb_mode",
         type=str,
-        default="online",
+        default="disabled",
         choices=["online", "offline", "disabled"],
         help="W&B mode. offline/disabled avoids needing a default team on wandb.ai.",
     )
     args = parser.parse_known_args()[0]
+
+    if args.wandb_mode != "disabled":
+        import wandb as wandb_module
+
+        wandb = wandb_module
 
     seed_all(args.seed, args.determ)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -198,7 +260,14 @@ if __name__ == "__main__":
         torch.cuda.set_device(device)
     print(f"Using device: {device} (torch {torch.__version__})")
 
-    datasets = get_pascalVOC(args)
+    if args.dataset == "pascal":
+        datasets = get_pascalVOC(args)
+    elif args.dataset == "coco":
+        datasets = get_coco(args)
+    elif args.dataset == "coco_rules":
+        datasets = get_coco_rules(args)
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}")
     pin_memory = device.type == "cuda"
     dataloaders = {
         k: DataLoader(
@@ -215,27 +284,36 @@ if __name__ == "__main__":
 
     class Config(TypedDict):
         embed_shape: Tuple[int, int]
+        decoder_type: str
+        hidden_dim: int
+        num_blocks: int
+        num_heads: int
+        dropout: float
         num_slots: int
         slot_dim: int
         num_slot_heads: int
         routing_iters: int
+        sa_topk_patches: int
         probabilistic: bool
         proj_cov: bool
 
     model_kwargs: Config = {
         "embed_shape": (args.num_patches, args.embed_dim),
+        "decoder_type": args.model_class,
+        "hidden_dim": args.hidden_dim,
+        "num_blocks": args.num_blocks,
+        "num_heads": args.num_heads,
+        "dropout": args.dropout,
         "num_slots": args.num_slots,
         "slot_dim": args.slot_dim,
         "num_slot_heads": args.num_slot_heads,
         "routing_iters": args.routing_iters,
+        "sa_topk_patches": args.sa_topk_patches,
         "probabilistic":  False,
         "proj_cov": args.proj_cov,
     }
 
-    if args.model_class == "mlp":
-        model = SlotAutoencoder(hidden_dim=args.hidden_dim, **model_kwargs)
-    else:
-        raise NotImplementedError
+    model = SlotAutoencoder(**model_kwargs)
 
     model.to(device)
     print(model)
@@ -278,7 +356,27 @@ if __name__ == "__main__":
     wandb_kwargs["mode"] = wandb_mode
     wandb.init(**wandb_kwargs)
     best_loss = 1e6
+    best_mbo_i_slots = -1.0
+    best_mbo_c_slots = -1.0
+    best_monitor = -float("inf")
+    stale_evals = 0
+    eval_count = 0
     start_t = time.time()
+
+    def save_checkpoint(name: str, step: int, metrics: Dict[str, float]) -> str:
+        save_path = f"./checkpoints/{args.exp_name}/{name}"
+        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+        torch.save(
+            {
+                "args": vars(args),
+                "step": step,
+                "metrics": metrics,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+            },
+            save_path,
+        )
+        return save_path
 
     for i in range(args.epochs):
         train_metrics = run_epoch(
@@ -301,18 +399,66 @@ if __name__ == "__main__":
                 f"\n{t} valid {', '.join(f'{k}: {v:.5f}' for k, v in valid_metrics.items())}"
             )
 
+            if args.monitor_metric not in valid_metrics:
+                raise ValueError(
+                    f"--monitor_metric={args.monitor_metric!r} is not in validation "
+                    f"metrics: {sorted(valid_metrics)}"
+                )
+
+            eval_count += 1
+            monitor_value = valid_metrics[args.monitor_metric]
+            improved_monitor = (
+                monitor_value > best_monitor + args.early_stop_min_delta
+            )
+            if improved_monitor:
+                best_monitor = monitor_value
+                stale_evals = 0
+            else:
+                stale_evals += 1
+
             if valid_metrics["loss"] < best_loss:
                 best_loss = valid_metrics["loss"]
-                save_path = f"./checkpoints/{args.exp_name}/checkpoint.pt"
-                os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
-                torch.save(
-                    {
-                        "args": vars(args),
-                        "step": step,
-                        "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                    },
-                    save_path,
+                save_path = save_checkpoint("checkpoint.pt", step, valid_metrics)
+                print(f"{t} best loss model saved: {save_path}")
+            if valid_metrics["mBO_i_slots"] > best_mbo_i_slots:
+                best_mbo_i_slots = valid_metrics["mBO_i_slots"]
+                save_path = save_checkpoint(
+                    "checkpoint_best_mbo_i_slots.pt", step, valid_metrics
                 )
-                print(f"{t} model saved: {save_path}")
+                print(f"{t} best mBO_i_slots model saved: {save_path}")
+            if valid_metrics["mBO_c_slots"] > best_mbo_c_slots:
+                best_mbo_c_slots = valid_metrics["mBO_c_slots"]
+                save_path = save_checkpoint(
+                    "checkpoint_best_mbo_c_slots.pt", step, valid_metrics
+                )
+                print(f"{t} best mBO_c_slots model saved: {save_path}")
+
+            should_stop = False
+            stop_reason = ""
+            can_stop = eval_count >= args.early_stop_min_evals
+            if (
+                can_stop
+                and args.collapse_drop_fraction > 0
+                and best_monitor > 0
+                and monitor_value < best_monitor * (1.0 - args.collapse_drop_fraction)
+            ):
+                should_stop = True
+                stop_reason = (
+                    f"{args.monitor_metric} collapsed from best {best_monitor:.5f} "
+                    f"to {monitor_value:.5f}"
+                )
+            elif (
+                can_stop
+                and args.early_stop_patience > 0
+                and stale_evals >= args.early_stop_patience
+            ):
+                should_stop = True
+                stop_reason = (
+                    f"{args.monitor_metric} did not improve for "
+                    f"{stale_evals} validation runs"
+                )
+
             ema.restore()  # restore model weights
+            if should_stop:
+                print(f"{t} early stop: {stop_reason}")
+                break
