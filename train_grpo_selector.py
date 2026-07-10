@@ -26,7 +26,8 @@ from tqdm import tqdm
 
 from misc_utils import seed_all
 from selector_grpo import GRPOSelectorConfig, SlotSelectorGRPO, true_class_margin
-from train_set_transformer_slot_probe import ProbeConfig, SetTransformerSlotProbe
+from settransformer.model import DiscriminativeSetTransformer as SetTransformerSlotProbe
+from settransformer.model import ProbeConfig
 from train_slot_classifier import build_dataset, build_transforms, load_backbone, subset_dataset
 
 

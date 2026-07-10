@@ -25,13 +25,13 @@ from torch.utils.data import DataLoader, Dataset
 
 from misc_utils import seed_all
 from settransformer.model import DiscriminativeSetTransformer, ProbeConfig, true_class_margin
-from structured80 import load_structured80, project_slots80
+from slothead80 import load_slothead80, project_slots80
 from train_slot_classifier import build_dataset, build_transforms, load_backbone, subset_dataset
 
 
-DEFAULT_DATA = "/vol/biomedic3/kw1025/dinosaur/analysis/coco_top2_clean_scenes_anchor009_evidence005_10cls_450_150_150/classification_dataset"
+DEFAULT_DATA = "/vol/biomedic3/kw1025/dinosaur/dataset/coco_top2_clean10_area006_004_600_200_200/classification_dataset"
 DEFAULT_SA = "/vol/biomedic3/kw1025/dinosaur/checkpoints/sa_coco_full_20260623_004920/checkpoint_best_mbo_i_slots.pt"
-DEFAULT_STRUCTURED80 = ""
+DEFAULT_SLOTHEAD80 = ""
 
 
 def make_loader(dataset: Dataset, args: argparse.Namespace, device: torch.device, shuffle: bool) -> DataLoader:
@@ -135,7 +135,7 @@ def train_epoch(model, backbone, projector, loader, device, optimizer, args) -> 
     seen = 0
     for images, labels in loader:
         labels = labels.to(device, non_blocking=device.type == "cuda")
-        slots = encode_slots80(backbone, projector, images, device, args.structured_mode)
+        slots = encode_slots80(backbone, projector, images, device, args.slothead_mode)
         loss, stats = compute_losses(model, slots, labels, args)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -156,7 +156,7 @@ def eval_epoch(model, backbone, projector, loader, device, args) -> dict[str, fl
     seen = 0
     for images, labels in loader:
         labels = labels.to(device, non_blocking=device.type == "cuda")
-        slots = encode_slots80(backbone, projector, images, device, args.structured_mode)
+        slots = encode_slots80(backbone, projector, images, device, args.slothead_mode)
         b, k, d = slots.shape
         all_mask = torch.ones(b, k, dtype=torch.bool, device=device)
         logits = model(slots, all_mask)
@@ -201,11 +201,11 @@ def parse_ints(raw: str) -> list[int]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train 80-dim structured-slot SetTransformer reward probe.")
+    parser = argparse.ArgumentParser(description="Train 80-dim slothead SetTransformer probe.")
     parser.add_argument("--data", default=DEFAULT_DATA)
     parser.add_argument("--sa_checkpoint", default=DEFAULT_SA)
-    parser.add_argument("--structured_checkpoint", default=DEFAULT_STRUCTURED80)
-    parser.add_argument("--structured_mode", choices=["u", "obj", "geo", "res", "obj_geo", "obj_res", "geo_res"], default="u")
+    parser.add_argument("--slothead_checkpoint", default=DEFAULT_SLOTHEAD80)
+    parser.add_argument("--slothead_mode", choices=["u", "obj", "geo", "res", "obj_geo", "obj_res", "geo_res"], default="u")
     parser.add_argument("--output_dir", default="SET80/checkpoints/set80")
     parser.add_argument("--input_res", type=int, default=224)
     parser.add_argument("--epochs", type=int, default=80)
@@ -241,8 +241,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if not args.structured_checkpoint:
-        raise ValueError("--structured_checkpoint is required for SET80; train or pass an 80-dim structured bottleneck checkpoint.")
+    if not args.slothead_checkpoint:
+        raise ValueError("--slothead_checkpoint is required for SET80; pass a fresh object-mode slothead checkpoint for the current dataset.")
     seed_all(args.seed, False)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     tfm = build_transforms(args.input_res)
@@ -256,15 +256,15 @@ def main() -> None:
     backbone = load_backbone(args.sa_checkpoint, device)
     backbone.eval()
     backbone.requires_grad_(False)
-    projector, structured_ckpt = load_structured80(args.structured_checkpoint, device)
-    slot_dim = int(projector.cfg.out_dim if args.structured_mode == "u" else encode_slots80(backbone, projector, next(iter(valid_loader))[0], device, args.structured_mode).size(-1))
+    projector, slothead_ckpt = load_slothead80(args.slothead_checkpoint, device)
+    slot_dim = int(projector.cfg.out_dim if args.slothead_mode == "u" else encode_slots80(backbone, projector, next(iter(valid_loader))[0], device, args.slothead_mode).size(-1))
 
     cfg = ProbeConfig(num_slots=backbone.num_slots, slot_dim=slot_dim, num_classes=len(classes), hidden_dim=args.hidden_dim, bottleneck_dim=args.bottleneck_dim, num_heads=args.num_heads, num_sab_layers=args.num_sab_layers, ff_dim=args.ff_dim, dropout=args.dropout)
     model = DiscriminativeSetTransformer(cfg).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    meta = {"args": vars(args), "probe_config": asdict(cfg), "classes": classes, "structured80_config": structured_ckpt["config"], "model_class": "settransformer.model.DiscriminativeSetTransformer"}
+    meta = {"args": vars(args), "probe_config": asdict(cfg), "classes": classes, "slothead80_config": slothead_ckpt["config"], "model_class": "settransformer.model.DiscriminativeSetTransformer"}
     (out_dir / "probe_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     print(f"device={device} train={len(train_set)} valid={len(valid_set)} classes={len(classes)} slot_dim={slot_dim}")

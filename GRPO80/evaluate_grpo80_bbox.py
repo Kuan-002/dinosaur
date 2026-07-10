@@ -25,25 +25,20 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
 
-from SET80.structured80 import load_structured80, project_slots80
+from SET80.slothead80 import load_slothead80, project_slots80
 from train_slot_classifier import build_dataset, build_transforms, load_backbone
-from visualize_grpo_selector_paths import choose_device, load_selector, trace_controls_from_meta
-
-from analysis.set_transformer_diagnostics.evaluate_set_transformer_bbox import (
+from visualize_grpo_selector_paths import choose_device, denorm_image, load_selector, trace_controls_from_meta
+from scripts.evaluate_set_bbox import (
     boxes_to_mask,
-    denorm_image,
-    draw_boxes,
-    fixed_sample_relative_path,
     load_coco_boxes,
     load_metadata,
     make_heatmaps,
     metric_summary,
-    needed_metadata_keys,
-    slot_bbox_metrics,
     transform_boxes_to_input,
     unwrap_dataset,
 )
@@ -64,8 +59,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", default="test", choices=["valid", "val", "test"])
     parser.add_argument("--coco_root", default="/vol/biomedic3/kw1025/dinosaur/dataset/coco2017")
     parser.add_argument("--sa_checkpoint", default="")
-    parser.add_argument("--structured_checkpoint", default="")
-    parser.add_argument("--structured_mode", default="")
+    parser.add_argument("--slothead_checkpoint", default="")
+    parser.add_argument("--slothead_mode", default="")
     parser.add_argument("--out_dir", default="")
     parser.add_argument("--input_res", type=int, default=0)
     parser.add_argument("--bs", type=int, default=32)
@@ -88,6 +83,45 @@ def dataset_indices(dataset: Dataset) -> list[int]:
 
 def meta_arg(meta: dict, name: str, default=None):
     return (meta.get("args") or {}).get(name, default)
+
+
+def fixed_sample_relative_path(base_dataset: Dataset, sample_idx: int, split: str) -> str:
+    sample_path = Path(base_dataset.samples[sample_idx][0])
+    root = Path(getattr(base_dataset, "root"))
+    rel = sample_path.relative_to(root).as_posix()
+    if rel.startswith(("train/", "valid/", "test/")):
+        return rel
+    return f"{split}/{rel}"
+
+
+def needed_metadata_keys(metadata: dict[str, dict[str, str]], dataset: Dataset, split: str) -> set[tuple[str, int, str]]:
+    base_dataset = unwrap_dataset(dataset)
+    keys = set()
+    for sample_idx in dataset_indices(dataset):
+        rel = fixed_sample_relative_path(base_dataset, sample_idx, split)
+        row = metadata[rel]
+        image_id = int(row["image_id"])
+        source_split = row["source_split"]
+        keys.add((source_split, image_id, row["anchor_object"]))
+        keys.add((source_split, image_id, row["evidence_object"]))
+    return keys
+
+
+def slot_bbox_metrics(heatmap: torch.Tensor, mask: torch.Tensor, threshold_rel: float) -> dict[str, float]:
+    if not mask.any():
+        return {"mass": 0.0}
+    active = heatmap >= (float(heatmap.max()) * threshold_rel)
+    selected_mass = float(heatmap[mask].sum().item())
+    active_overlap = float((active & mask).sum().item()) / float(active.sum().item() or 1)
+    return {"mass": max(selected_mass, active_overlap)}
+
+
+def draw_boxes(ax, boxes: torch.Tensor, color: str, label: str) -> None:
+    for idx, (x1, y1, x2, y2) in enumerate(boxes.tolist()):
+        rect = Rectangle((x1, y1), max(x2 - x1, 1.0), max(y2 - y1, 1.0), fill=False, edgecolor=color, linewidth=1.5)
+        ax.add_patch(rect)
+        if idx == 0:
+            ax.text(x1, y1, label, color=color, fontsize=7, bbox={"facecolor": "black", "alpha": 0.35, "pad": 1})
 
 
 @torch.no_grad()
@@ -170,16 +204,16 @@ def main() -> None:
     device = choose_device(args.device)
     run_dir = Path(args.run_dir)
     meta, model, _checkpoint = load_selector(run_dir, args.checkpoint, device)
-    if meta.get("slot_embedding_source") != "structured80_slothead":
-        raise ValueError(f"Expected structured80_slothead selector, got {meta.get('slot_embedding_source')!r}")
+    if meta.get("slot_embedding_source") != "slothead80":
+        raise ValueError(f"Expected slothead80 selector, got {meta.get('slot_embedding_source')!r}")
 
     data = args.data or meta_arg(meta, "data")
     sa_checkpoint = args.sa_checkpoint or meta_arg(meta, "sa_checkpoint") or meta_arg(meta, "checkpoint")
-    structured_checkpoint = args.structured_checkpoint or meta_arg(meta, "structured_checkpoint")
-    structured_mode = args.structured_mode or meta_arg(meta, "structured_mode", "u")
+    slothead_checkpoint = args.slothead_checkpoint or meta_arg(meta, "slothead_checkpoint")
+    slothead_mode = args.slothead_mode or meta_arg(meta, "slothead_mode", "u")
     input_res = args.input_res or int(meta_arg(meta, "input_res", 224))
-    if not data or not sa_checkpoint or not structured_checkpoint:
-        raise ValueError("Missing data, sa_checkpoint, or structured_checkpoint; pass them explicitly.")
+    if not data or not sa_checkpoint or not slothead_checkpoint:
+        raise ValueError("Missing data, sa_checkpoint, or slothead_checkpoint; pass them explicitly.")
 
     top_k_max = max(args.top_ks)
     out_dir = Path(args.out_dir) if args.out_dir else run_dir / "visualizations" / f"{split}_grpo80_bbox_at3_at4"
@@ -209,7 +243,7 @@ def main() -> None:
     backbone = load_backbone(sa_checkpoint, device)
     backbone.eval()
     backbone.requires_grad_(False)
-    projector, _structured_ckpt = load_structured80(structured_checkpoint, device)
+    projector, _slothead_ckpt = load_slothead80(slothead_checkpoint, device)
     controls = trace_controls_from_meta(meta)
     confidence_early_exit = not bool(meta_arg(meta, "disable_confidence_early_exit", False))
 
@@ -219,7 +253,7 @@ def main() -> None:
     cursor = 0
     for images, labels in tqdm(loader, desc="grpo80-bbox-eval", mininterval=1.0):
         labels = labels.to(device, non_blocking=device.type == "cuda")
-        slots80, attn = encode_slots80(backbone, projector, images, device, structured_mode)
+        slots80, attn = encode_slots80(backbone, projector, images, device, slothead_mode)
         out, selected_by_item = selector_selected_slots(model, slots80, controls, confidence_early_exit)
         pred = out.logits.argmax(dim=1).detach().cpu()
         batch = labels.numel()
@@ -314,8 +348,8 @@ def main() -> None:
         "run_dir": str(run_dir),
         "checkpoint": args.checkpoint,
         "sa_checkpoint": sa_checkpoint,
-        "structured_checkpoint": structured_checkpoint,
-        "structured_mode": structured_mode,
+        "slothead_checkpoint": slothead_checkpoint,
+        "slothead_mode": slothead_mode,
         "data": data,
         "split": split,
         "items": len(rows),

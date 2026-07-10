@@ -9,7 +9,7 @@ import torch.nn as nn
 
 
 @dataclass
-class Structured56Config:
+class Slothead80Config:
     slot_dim: int
     obj_dim: int
     geo_dim: int
@@ -23,8 +23,8 @@ class Structured56Config:
         return self.obj_dim + self.geo_dim + self.res_dim
 
 
-class Structured56Projector(nn.Module):
-    def __init__(self, cfg: Structured56Config):
+class Slothead80Projector(nn.Module):
+    def __init__(self, cfg: Slothead80Config):
         super().__init__()
         self.cfg = cfg
         self.projector = nn.Sequential(
@@ -34,6 +34,8 @@ class Structured56Projector(nn.Module):
             nn.Dropout(cfg.dropout),
             nn.Linear(cfg.hidden_dim, cfg.out_dim),
         )
+        self.obj_head = nn.Linear(cfg.obj_dim, 1)
+        self.geo_head = nn.Sequential(nn.LayerNorm(cfg.geo_dim), nn.Linear(cfg.geo_dim, 5))
 
     def split(self, slots: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         u = self.projector(slots)
@@ -57,19 +59,46 @@ class Structured56Projector(nn.Module):
             return torch.cat([u_obj, u_res], dim=-1)
         if mode == "geo_res":
             return torch.cat([u_geo, u_res], dim=-1)
-        raise ValueError(f"Unknown structured slot mode: {mode}")
+        raise ValueError(f"Unknown slothead mode: {mode}")
+
+    def reward_features(self, slots: torch.Tensor) -> dict[str, torch.Tensor]:
+        u, u_obj, u_geo, u_res = self.split(slots)
+        return {
+            "u": u,
+            "u_obj": u_obj,
+            "u_geo": u_geo,
+            "u_res": u_res,
+            "objectness": self.obj_head(u_obj).squeeze(-1).sigmoid(),
+            "geometry": self.geo_head(u_geo).sigmoid(),
+        }
 
 
-def load_structured56(path: str | Path, device: torch.device) -> tuple[Structured56Projector, dict[str, Any]]:
+def load_slothead80(path: str | Path, device: torch.device) -> tuple[Slothead80Projector, dict[str, Any]]:
     ckpt = torch.load(path, map_location=device, weights_only=False)
-    cfg = Structured56Config(**ckpt["config"])
-    model = Structured56Projector(cfg).to(device)
+    cfg = Slothead80Config(**ckpt["config"])
+    model = Slothead80Projector(cfg).to(device)
     projector_state = {
         key.removeprefix("projector."): value
         for key, value in ckpt["model_state_dict"].items()
         if key.startswith("projector.")
     }
     model.projector.load_state_dict(projector_state)
+    if "obj_head.weight" in ckpt["model_state_dict"]:
+        model.obj_head.load_state_dict(
+            {
+                key.removeprefix("obj_head."): value
+                for key, value in ckpt["model_state_dict"].items()
+                if key.startswith("obj_head.")
+            }
+        )
+    if "geo_head.1.weight" in ckpt["model_state_dict"]:
+        model.geo_head.load_state_dict(
+            {
+                key.removeprefix("geo_head."): value
+                for key, value in ckpt["model_state_dict"].items()
+                if key.startswith("geo_head.")
+            }
+        )
     model.eval()
     for param in model.parameters():
         param.requires_grad = False
@@ -77,5 +106,5 @@ def load_structured56(path: str | Path, device: torch.device) -> tuple[Structure
 
 
 @torch.no_grad()
-def project_slots56(projector: Structured56Projector, slots: torch.Tensor, mode: str = "u") -> torch.Tensor:
+def project_slots80(projector: Slothead80Projector, slots: torch.Tensor, mode: str = "u") -> torch.Tensor:
     return projector(slots, mode=mode).detach()

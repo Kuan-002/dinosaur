@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=structured80
+#SBATCH --job-name=slothead56
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 #SBATCH --partition=gpus24
@@ -9,25 +9,25 @@
 set -euo pipefail
 
 cd /vol/biomedic3/kw1025/dinosaur
-mkdir -p logs SET80/checkpoints
+mkdir -p logs SET56/checkpoints
 
-RUN_NAME="${RUN_NAME:-structured80_obj16_geo16_res48_$(date +%Y%m%d_%H%M%S)}"
-OUT_DIR="${OUT_DIR:-SET80/checkpoints/${RUN_NAME}}"
+RUN_NAME="${RUN_NAME:-slothead56_obj16_geo16_res24_$(date +%Y%m%d_%H%M%S)}"
+OUT_DIR="${OUT_DIR:-SET56/checkpoints/${RUN_NAME}}"
 PYTHON="${PYTHON:-.venv/bin/python}"
 
 COCO_ROOT="${COCO_ROOT:-/vol/biomedic3/kw1025/dinosaur/dataset/coco2017}"
-CLASSIFICATION_DATASET="${CLASSIFICATION_DATASET:-/vol/biomedic3/kw1025/dinosaur/analysis/coco_top2_clean_scenes_anchor009_evidence005_10cls_450_150_150/classification_dataset}"
+CLASSIFICATION_DATASET="${CLASSIFICATION_DATASET:-/vol/biomedic3/kw1025/dinosaur/dataset/coco_top2_clean10_area006_004_600_200_200/classification_dataset}"
 SA_CHECKPOINT="${SA_CHECKPOINT:-/vol/biomedic3/kw1025/dinosaur/checkpoints/sa_coco_full_20260623_004920/checkpoint_best_mbo_i_slots.pt}"
 
 mkdir -p "${OUT_DIR}"
 
-echo "SET80 structured bottleneck"
+echo "SET56 slothead"
 echo "out_dir=${OUT_DIR}"
-echo "split=z -> u_obj:${OBJ_DIM:-16} u_geo:${GEO_DIM:-16} u_res:${RES_DIM:-48}"
+echo "split=z -> u_obj:${OBJ_DIM:-16} u_geo:${GEO_DIM:-16} u_res:${RES_DIM:-24}"
 
 OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}" \
 MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}" \
-"${PYTHON}" SET80/train_structured80.py \
+"${PYTHON}" SET56/train_slothead56.py \
   --coco_root "${COCO_ROOT}" \
   --classification_dataset "${CLASSIFICATION_DATASET}" \
   --sa_checkpoint "${SA_CHECKPOINT}" \
@@ -41,11 +41,12 @@ MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}" \
   --hidden_dim "${HIDDEN_DIM:-256}" \
   --obj_dim "${OBJ_DIM:-16}" \
   --geo_dim "${GEO_DIM:-16}" \
-  --res_dim "${RES_DIM:-48}" \
+  --res_dim "${RES_DIM:-24}" \
   --dropout "${DROPOUT:-0.1}" \
   --lambda_obj "${LAMBDA_OBJ:-1.0}" \
   --lambda_geo "${LAMBDA_GEO:-2.0}" \
   --lambda_cat "${LAMBDA_CAT:-0.5}" \
+  --category_mode "${CATEGORY_MODE:-object}" \
   --lambda_rec "${LAMBDA_REC:-0.1}" \
   --lambda_orth "${LAMBDA_ORTH:-0.02}" \
   --obj_pos_weight "${OBJ_POS_WEIGHT:-4.0}" \
@@ -63,4 +64,4 @@ MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}" \
   --device "${DEVICE:-auto}" \
   --seed "${SEED:-8}"
 
-echo "SET80 structured checkpoint: ${OUT_DIR}/structured_slot_bottleneck_best.pt"
+echo "SET56 slothead checkpoint: ${OUT_DIR}/slothead_best.pt"

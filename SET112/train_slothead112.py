@@ -74,7 +74,7 @@ class BottleneckConfig:
     num_categories: int
 
 
-class StructuredSlotBottleneck(nn.Module):
+class SlotheadProjector(nn.Module):
     def __init__(self, cfg: BottleneckConfig):
         super().__init__()
         self.cfg = cfg
@@ -213,8 +213,6 @@ class ClassificationMetadataCocoInstanceDataset(Dataset):
             "image_id": image_id,
             "width": int(row["width"]),
             "height": int(row["height"]),
-            "scene_class_name": row["class_name"],
-            "scene_class_idx": int(row["class_idx"]),
             "source_split": source_split,
             "annotations": self.anns_by_source_image.get((source_split, image_id), []),
         }
@@ -738,8 +736,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--wd", type=float, default=1e-4)
     p.add_argument("--hidden_dim", type=int, default=256)
     p.add_argument("--obj_dim", type=int, default=16)
-    p.add_argument("--geo_dim", type=int, default=16)
-    p.add_argument("--res_dim", type=int, default=48)
+    p.add_argument("--geo_dim", type=int, default=32)
+    p.add_argument("--res_dim", type=int, default=64)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--lambda_obj", type=float, default=1.0)
     p.add_argument("--lambda_geo", type=float, default=2.0)
@@ -753,6 +751,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ignore_coverage", type=float, default=0.12)
     p.add_argument("--ignore_purity", type=float, default=0.10)
     p.add_argument("--bbox_shrink", type=float, default=0.70)
+    p.add_argument(
+        "--category_mode",
+        choices=["object", "coco"],
+        default="object",
+        help="Use one class named object for bbox-derived category targets by default; coco restores COCO category labels.",
+    )
     p.add_argument("--quick_limit_train", type=int, default=0)
     p.add_argument("--quick_limit_val", type=int, default=0)
     p.add_argument("--diagnostic_max_train_slots", type=int, default=300000)
@@ -783,14 +787,26 @@ def main() -> None:
         val_set = CocoInstanceDataset(args.coco_root, "val", tfm["valid"], args.input_res, args.quick_limit_val)
     train_loader = DataLoader(train_set, batch_size=args.bs, shuffle=True, drop_last=False, num_workers=args.num_workers, collate_fn=collate_coco, pin_memory=device.type == "cuda", persistent_workers=args.num_workers > 0)
     val_loader = DataLoader(val_set, batch_size=args.bs, shuffle=False, drop_last=False, num_workers=args.num_workers, collate_fn=collate_coco, pin_memory=device.type == "cuda", persistent_workers=args.num_workers > 0)
-    cat_ids = sorted(COCO_CATEGORY_BY_ID)
-    cat_to_idx = {cat_id: i for i, cat_id in enumerate(cat_ids)}
+    if args.category_mode == "object":
+        cat_ids = sorted(COCO_CATEGORY_BY_ID)
+        cat_to_idx = {cat_id: 0 for cat_id in cat_ids}
+        saved_category_ids = [0]
+        category_index = {"0": "object"}
+        category_names = ["object"]
+        num_categories = 1
+    else:
+        cat_ids = sorted(COCO_CATEGORY_BY_ID)
+        cat_to_idx = {cat_id: i for i, cat_id in enumerate(cat_ids)}
+        saved_category_ids = cat_ids
+        category_index = {str(cat_to_idx[k]): COCO_CATEGORY_BY_ID[k] for k in cat_ids}
+        category_names = [COCO_CATEGORY_BY_ID[k] for k in cat_ids]
+        num_categories = len(cat_ids)
     backbone = load_backbone(args.sa_checkpoint, device)
     backbone.eval()
     backbone.requires_grad_(False)
     slot_dim = int(getattr(backbone, "slot_dim"))
-    cfg = BottleneckConfig(slot_dim, args.obj_dim, args.geo_dim, args.res_dim, args.hidden_dim, args.dropout, len(cat_ids))
-    model = StructuredSlotBottleneck(cfg).to(device)
+    cfg = BottleneckConfig(slot_dim, args.obj_dim, args.geo_dim, args.res_dim, args.hidden_dim, args.dropout, num_categories)
+    model = SlotheadProjector(cfg).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     meta = {
         "setting": "single projection splitting frozen DINOSAUR slot embeddings into u_obj/u_geo/u_res",
@@ -800,7 +816,7 @@ def main() -> None:
         "bbox_compensation": "COCO polygon masks are used when possible; otherwise bbox is center-shrunk before overlap matching.",
         "args": vars(args),
         "config": asdict(cfg),
-        "category_index": {str(cat_to_idx[k]): COCO_CATEGORY_BY_ID[k] for k in cat_ids},
+        "category_index": category_index,
     }
     (out_dir / "experiment_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     history: list[dict[str, Any]] = []
@@ -831,12 +847,12 @@ def main() -> None:
                     "config": asdict(cfg),
                     "model_state_dict": model.state_dict(),
                     "args": vars(args),
-                    "category_ids": cat_ids,
-                    "category_names": [COCO_CATEGORY_BY_ID[k] for k in cat_ids],
+                    "category_ids": saved_category_ids,
+                    "category_names": category_names,
                 },
-                out_dir / "structured_slot_bottleneck_best.pt",
+                out_dir / "slothead_best.pt",
             )
-    ckpt = torch.load(out_dir / "structured_slot_bottleneck_best.pt", map_location=device, weights_only=False)
+    ckpt = torch.load(out_dir / "slothead_best.pt", map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
     final = {
         "best_epoch": best_epoch,
@@ -844,7 +860,7 @@ def main() -> None:
         "validation": evaluate(model, backbone, val_loader, args, device, cat_to_idx),
         "leakage_diagnostics": run_leakage_diagnostics(model, backbone, train_loader, val_loader, args, device, cat_to_idx),
         "outputs": {
-            "checkpoint": str(out_dir / "structured_slot_bottleneck_best.pt"),
+            "checkpoint": str(out_dir / "slothead_best.pt"),
             "meta": str(out_dir / "experiment_meta.json"),
             "history": str(out_dir / "history_metrics.csv"),
         },

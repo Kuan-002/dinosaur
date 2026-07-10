@@ -12,66 +12,16 @@ from pathlib import Path
 
 
 DEFAULT_CONCEPTS = [
-    {
-        "name": "dining_table_scene",
-        "anchors": ["dining table"],
-        "evidence": ["person", "cup", "bowl", "pizza", "sandwich", "cake", "wine glass", "bottle", "fork", "knife", "spoon", "hot dog", "donut"],
-        "description": "dominant dining table plus person/tableware/food",
-    },
-    {
-        "name": "bed_context_scene",
-        "anchors": ["bed"],
-        "evidence": ["person", "cat", "dog", "teddy bear", "suitcase", "chair"],
-        "description": "dominant bed plus person, animal, or nearby object",
-    },
-    {
-        "name": "road_vehicle_scene",
-        "anchors": ["car", "bus", "truck"],
-        "evidence": ["person", "traffic light", "stop sign", "parking meter", "fire hydrant"],
-        "description": "dominant road vehicle plus road/person context",
-    },
-    {
-        "name": "large_animal_scene",
-        "anchors": ["horse", "cow", "sheep", "elephant", "giraffe", "zebra"],
-        "evidence": ["person"],
-        "description": "dominant large animal plus human context",
-    },
-    {
-        "name": "bench_context_scene",
-        "anchors": ["bench"],
-        "evidence": ["person", "cat", "dog", "bird", "bicycle", "potted plant", "chair", "teddy bear", "umbrella", "book", "suitcase"],
-        "description": "dominant bench plus person, animal, or nearby object",
-    },
-    {
-        "name": "couch_context_scene",
-        "anchors": ["couch"],
-        "evidence": ["person", "cat", "dog", "chair", "teddy bear", "suitcase"],
-        "description": "dominant couch plus person, animal, or nearby object",
-    },
-    {
-        "name": "device_interaction_scene",
-        "anchors": ["laptop", "keyboard", "tv"],
-        "evidence": ["person", "cat", "dog", "chair", "book", "mouse", "cell phone", "remote"],
-        "description": "dominant electronic device plus user or interaction object",
-    },
-    {
-        "name": "sports_equipment_scene",
-        "anchors": ["surfboard", "skateboard", "tennis racket", "kite", "snowboard", "skis", "baseball bat", "sports ball", "frisbee"],
-        "evidence": ["person"],
-        "description": "dominant sports equipment plus participant",
-    },
-    {
-        "name": "motorcycle_person_scene",
-        "anchors": ["motorcycle"],
-        "evidence": ["person"],
-        "description": "dominant motorcycle plus person",
-    },
-    {
-        "name": "kitchen_appliance_context_scene",
-        "anchors": ["oven", "refrigerator", "microwave"],
-        "evidence": ["person", "bottle", "pizza", "bowl", "chair", "cat", "dog", "cake", "broccoli", "carrot", "sandwich", "cup", "sink"],
-        "description": "dominant kitchen appliance plus food, person, animal, or nearby object",
-    },
+    {"name": "dining_table_scene", "anchors": ["dining table"], "evidence": ["person", "cup", "bowl", "pizza", "sandwich", "cake", "wine glass", "bottle", "fork", "knife", "spoon", "hot dog", "donut"], "description": "dominant dining table plus person/tableware/food"},
+    {"name": "bed_context_scene", "anchors": ["bed"], "evidence": ["person", "cat", "dog", "teddy bear", "suitcase", "chair"], "description": "dominant bed plus person, animal, or nearby object"},
+    {"name": "road_vehicle_scene", "anchors": ["car", "bus", "truck"], "evidence": ["person", "traffic light", "stop sign", "parking meter", "fire hydrant"], "description": "dominant road vehicle plus road/person context"},
+    {"name": "large_animal_scene", "anchors": ["horse", "cow", "sheep", "elephant", "giraffe", "zebra"], "evidence": ["person"], "description": "dominant large animal plus human context"},
+    {"name": "bench_context_scene", "anchors": ["bench"], "evidence": ["person", "cat", "dog", "bird", "bicycle", "potted plant", "chair", "teddy bear", "umbrella", "book", "suitcase"], "description": "dominant bench plus person, animal, or nearby object"},
+    {"name": "couch_context_scene", "anchors": ["couch"], "evidence": ["person", "cat", "dog", "chair", "teddy bear", "suitcase"], "description": "dominant couch plus person, animal, or nearby object"},
+    {"name": "device_interaction_scene", "anchors": ["laptop", "keyboard", "tv"], "evidence": ["person", "cat", "dog", "chair", "book", "mouse", "cell phone", "remote"], "description": "dominant electronic device plus user or interaction object"},
+    {"name": "sports_equipment_scene", "anchors": ["surfboard", "skateboard", "tennis racket", "kite", "snowboard", "skis", "baseball bat", "sports ball", "frisbee"], "evidence": ["person"], "description": "dominant sports equipment plus participant"},
+    {"name": "motorcycle_person_scene", "anchors": ["motorcycle"], "evidence": ["person"], "description": "dominant motorcycle plus person"},
+    {"name": "kitchen_appliance_context_scene", "anchors": ["oven", "refrigerator", "microwave"], "evidence": ["person", "bottle", "pizza", "bowl", "chair", "cat", "dog", "cake", "broccoli", "carrot", "sandwich", "cup", "sink"], "description": "dominant kitchen appliance plus food, person, animal, or nearby object"},
 ]
 
 
@@ -98,6 +48,12 @@ def materialize_image(src: Path, dst: Path, mode: str) -> None:
         shutil.copy2(src, dst)
     else:
         raise ValueError(f"unknown materialize mode: {mode}")
+
+
+def candidate_strength(row: dict[str, str]) -> tuple[float, float, float, int]:
+    anchor = float(row["anchor_area_ratio"])
+    evidence = float(row["evidence_area_ratio"])
+    return (min(anchor, evidence), anchor + evidence, max(anchor, evidence), int(row["image_id"]))
 
 
 def validate_concepts(concepts: list[dict]) -> None:
@@ -163,8 +119,7 @@ def collect_candidates(
                     continue
                 if max(ratios[obj] for obj in evidence) <= min_evidence_area_ratio:
                     continue
-                if anchors and evidence:
-                    matches.append(concept)
+                matches.append(concept)
             if len(matches) > 1:
                 ambiguous += 1
                 continue
@@ -211,6 +166,7 @@ def main() -> None:
     parser.add_argument("--test_per_class", type=int, default=100)
     parser.add_argument("--seed", type=int, default=8)
     parser.add_argument("--materialize", choices=["none", "symlink", "copy"], default="none")
+    parser.add_argument("--selection_strategy", choices=["random", "largest_objects"], default="random")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -236,7 +192,11 @@ def main() -> None:
     balanced: list[dict[str, str]] = []
     for class_name in classes:
         rows = [dict(row) for row in by_class[class_name]]
-        rng.shuffle(rows)
+        if args.selection_strategy == "random":
+            rng.shuffle(rows)
+        else:
+            rng.shuffle(rows)
+            rows.sort(key=candidate_strength, reverse=True)
         offset = 0
         for split, count in [("train", args.train_per_class), ("val", args.val_per_class), ("test", args.test_per_class)]:
             for row in rows[offset : offset + count]:
@@ -290,6 +250,7 @@ def main() -> None:
         "class_to_idx": class_to_idx,
         "concepts": concepts,
         "materialize": args.materialize,
+        "selection_strategy": args.selection_strategy,
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
 

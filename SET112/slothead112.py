@@ -9,7 +9,7 @@ import torch.nn as nn
 
 
 @dataclass
-class Structured112Config:
+class Slothead112Config:
     slot_dim: int
     obj_dim: int
     geo_dim: int
@@ -23,8 +23,8 @@ class Structured112Config:
         return self.obj_dim + self.geo_dim + self.res_dim
 
 
-class Structured112Projector(nn.Module):
-    def __init__(self, cfg: Structured112Config):
+class Slothead112Projector(nn.Module):
+    def __init__(self, cfg: Slothead112Config):
         super().__init__()
         self.cfg = cfg
         self.projector = nn.Sequential(
@@ -57,13 +57,13 @@ class Structured112Projector(nn.Module):
             return torch.cat([u_obj, u_res], dim=-1)
         if mode == "geo_res":
             return torch.cat([u_geo, u_res], dim=-1)
-        raise ValueError(f"Unknown structured slot mode: {mode}")
+        raise ValueError(f"Unknown slothead mode: {mode}")
 
 
-def load_structured112(path: str | Path, device: torch.device) -> tuple[Structured112Projector, dict[str, Any]]:
+def load_slothead112(path: str | Path, device: torch.device) -> tuple[Slothead112Projector, dict[str, Any]]:
     ckpt = torch.load(path, map_location=device, weights_only=False)
-    cfg = Structured112Config(**ckpt["config"])
-    model = Structured112Projector(cfg).to(device)
+    cfg = Slothead112Config(**ckpt["config"])
+    model = Slothead112Projector(cfg).to(device)
     projector_state = {
         key.removeprefix("projector."): value
         for key, value in ckpt["model_state_dict"].items()
@@ -77,5 +77,5 @@ def load_structured112(path: str | Path, device: torch.device) -> tuple[Structur
 
 
 @torch.no_grad()
-def project_slots112(projector: Structured112Projector, slots: torch.Tensor, mode: str = "u") -> torch.Tensor:
+def project_slots112(projector: Slothead112Projector, slots: torch.Tensor, mode: str = "u") -> torch.Tensor:
     return projector(slots, mode=mode).detach()

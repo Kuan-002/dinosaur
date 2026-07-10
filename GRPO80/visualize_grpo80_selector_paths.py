@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Visualize GRPO80 selector paths over structured 80-dim slothead features."""
+"""Visualize GRPO80 selector paths over 80-dim slothead features."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ os.environ.setdefault("TORCH_HOME", str(REPO_ROOT / ".cache" / "torch"))
 import torch
 
 from misc_utils import seed_all
-from SET80.structured80 import load_structured80, project_slots80
+from SET80.slothead80 import load_slothead80, project_slots80
 from train_slot_classifier import build_dataset, build_transforms, load_backbone
 from visualize_grpo_selector_paths import (
     apply_trace_overrides,
@@ -39,8 +39,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", default="selector_grpo_best.pt")
     parser.add_argument("--data", default="")
     parser.add_argument("--sa_checkpoint", default="")
-    parser.add_argument("--structured_checkpoint", default="")
-    parser.add_argument("--structured_mode", default="")
+    parser.add_argument("--slothead_checkpoint", default="")
+    parser.add_argument("--slothead_mode", default="")
     parser.add_argument("--out_dir", default="")
     parser.add_argument("--split", default="test", choices=["train", "val", "valid", "test", "confounding_test"])
     parser.add_argument("--per_class_correct", type=int, default=2)
@@ -76,17 +76,17 @@ def main() -> None:
     run_dir = Path(args.run_dir)
     device = choose_device(args.device)
     meta, model, _checkpoint = load_selector(run_dir, args.checkpoint, device)
-    if meta.get("slot_embedding_source") != "structured80_slothead":
-        raise ValueError(f"Expected structured80_slothead selector, got {meta.get('slot_embedding_source')!r}")
+    if meta.get("slot_embedding_source") != "slothead80":
+        raise ValueError(f"Expected slothead80 selector, got {meta.get('slot_embedding_source')!r}")
 
     trace_controls = apply_trace_overrides(trace_controls_from_meta(meta), args)
     data = args.data or meta_arg(meta, "data")
     sa_checkpoint = args.sa_checkpoint or meta_arg(meta, "sa_checkpoint") or meta_arg(meta, "checkpoint")
-    structured_checkpoint = args.structured_checkpoint or meta_arg(meta, "structured_checkpoint")
-    structured_mode = args.structured_mode or meta_arg(meta, "structured_mode", "u")
+    slothead_checkpoint = args.slothead_checkpoint or meta_arg(meta, "slothead_checkpoint")
+    slothead_mode = args.slothead_mode or meta_arg(meta, "slothead_mode", "u")
     input_res = args.input_res or int(meta_arg(meta, "input_res", 224))
-    if not data or not sa_checkpoint or not structured_checkpoint:
-        raise ValueError("Missing data, sa_checkpoint, or structured_checkpoint; pass them explicitly.")
+    if not data or not sa_checkpoint or not slothead_checkpoint:
+        raise ValueError("Missing data, sa_checkpoint, or slothead_checkpoint; pass them explicitly.")
 
     out_dir = Path(args.out_dir) if args.out_dir else run_dir / "visualizations" / f"{args.split}_slot_paths"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -105,7 +105,7 @@ def main() -> None:
     backbone = load_backbone(sa_checkpoint, device)
     backbone.eval()
     backbone.requires_grad_(False)
-    projector, _structured_ckpt = load_structured80(structured_checkpoint, device)
+    projector, _slothead_ckpt = load_slothead80(slothead_checkpoint, device)
 
     per_class = {label: {"correct": 0, "wrong": 0} for label in sorted(target_classes)}
     records = []
@@ -117,7 +117,7 @@ def main() -> None:
         label = int(label_tensor)
         if label not in per_class:
             continue
-        slots, attn = batch_slots_attn80(backbone, projector, image.unsqueeze(0), device, structured_mode)
+        slots, attn = batch_slots_attn80(backbone, projector, image.unsqueeze(0), device, slothead_mode)
         trace = greedy_trace(model, slots, None, label, trace_controls)
         correct = trace["pred"] == label
         bucket = "correct" if correct else "wrong"
@@ -163,7 +163,7 @@ def main() -> None:
     html = ["<html><body><h1>DINOSAUR GRPO80 selector slot paths</h1>"]
     html.append(
         f"<p>run_dir={run_dir}<br>split={split}<br>records={len(records)} seen={seen}"
-        f"<br>structured_mode={structured_mode}<br>min_steps={trace_controls['min_steps']} "
+        f"<br>slothead_mode={slothead_mode}<br>min_steps={trace_controls['min_steps']} "
         f"threshold={trace_controls['early_exit_conf']}</p>"
     )
     for rec in records:

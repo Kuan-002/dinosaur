@@ -14,13 +14,19 @@ mkdir -p logs SET56/checkpoints
 RUN_NAME="${RUN_NAME:-set56_u_$(date +%Y%m%d_%H%M%S)}"
 OUT_DIR="${OUT_DIR:-SET56/checkpoints/${RUN_NAME}}"
 PYTHON="${PYTHON:-.venv/bin/python}"
+SLOTHEAD56_CHECKPOINT="${SLOTHEAD56_CHECKPOINT:-/vol/biomedic3/kw1025/dinosaur/SET56/checkpoints/slothead56_obj16_geo16_res24_20260709_192411/slothead_best.pt}"
+
+if [[ -z "${SLOTHEAD56_CHECKPOINT}" ]]; then
+  echo "SLOTHEAD56_CHECKPOINT must point to a fresh object-mode slothead checkpoint for the current dataset." >&2
+  exit 2
+fi
 
 "${PYTHON}" SET56/train_set56.py \
   --output_dir "${OUT_DIR}" \
-  --data "${DATA:-/vol/biomedic3/kw1025/dinosaur/analysis/coco_top2_clean_scenes_anchor009_evidence005_10cls_450_150_150/classification_dataset}" \
+  --data "${DATA:-/vol/biomedic3/kw1025/dinosaur/dataset/coco_top2_clean10_area006_004_600_200_200/classification_dataset}" \
   --sa_checkpoint "${SA_CHECKPOINT:-/vol/biomedic3/kw1025/dinosaur/checkpoints/sa_coco_full_20260623_004920/checkpoint_best_mbo_i_slots.pt}" \
-  --structured_checkpoint "${STRUCTURED56_CHECKPOINT:-/vol/biomedic3/kw1025/dinosaur/analysis/structured_slot_bottleneck/structured_slot_bottleneck_10cls450_20260708_011844/structured_slot_bottleneck_best.pt}" \
-  --structured_mode "${STRUCTURED_MODE:-u}" \
+  --slothead_checkpoint "${SLOTHEAD56_CHECKPOINT}" \
+  --slothead_mode "${SLOTHEAD_MODE:-u}" \
   --epochs "${EPOCHS:-80}" \
   --bs "${BS:-32}" \
   --num_workers "${NUM_WORKERS:-4}" \
