@@ -57,7 +57,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top_ks", type=parse_top_ks, default=parse_top_ks("3,4"))
     parser.add_argument("--hit_threshold", type=float, default=0.4)
     parser.add_argument("--threshold_rel", type=float, default=0.5)
-    parser.add_argument("--rank_score", choices=["true_prob", "true_margin"], default="true_prob")
+    parser.add_argument(
+        "--rank_score",
+        choices=["true_prob", "true_margin", "predicted_greedy_prob", "predicted_greedy_margin"],
+        default="true_prob",
+    )
     parser.add_argument("--device", default="auto")
     return parser.parse_args()
 
@@ -232,6 +236,28 @@ def load_probe(path: str, device: torch.device) -> tuple[DiscriminativeSetTransf
 
 def rank_slots(model: DiscriminativeSetTransformer, slots: torch.Tensor, labels: torch.Tensor, score_mode: str) -> list[list[int]]:
     b, k, d = slots.shape
+    if score_mode.startswith("predicted_greedy_"):
+        full_mask = torch.ones(b, k, dtype=torch.bool, device=slots.device)
+        target = model(slots, full_mask).argmax(dim=1)
+        selected = torch.zeros_like(full_mask)
+        ranking = []
+        for _step in range(k):
+            candidate_masks = selected[:, None].expand(-1, k, -1).clone()
+            candidate_masks[:, torch.arange(k, device=slots.device), torch.arange(k, device=slots.device)] = True
+            flat_slots = slots[:, None].expand(-1, k, -1, -1).reshape(b * k, k, d)
+            logits = model(flat_slots, candidate_masks.reshape(b * k, k)).reshape(b, k, -1)
+            if score_mode.endswith("_prob"):
+                scores = logits.softmax(dim=-1).gather(2, target[:, None, None].expand(-1, k, 1)).squeeze(-1)
+            else:
+                target_logits = logits.gather(2, target[:, None, None].expand(-1, k, 1)).squeeze(-1)
+                other_logits = logits.masked_fill(
+                    F.one_hot(target, logits.size(-1)).bool()[:, None], torch.finfo(logits.dtype).min
+                ).amax(dim=-1)
+                scores = target_logits - other_logits
+            choice = scores.masked_fill(selected, torch.finfo(scores.dtype).min).argmax(dim=1)
+            ranking.append(choice)
+            selected.scatter_(1, choice[:, None], True)
+        return torch.stack(ranking, dim=1).detach().cpu().tolist()
     masks = torch.eye(k, dtype=torch.bool, device=slots.device).unsqueeze(0).expand(b, -1, -1)
     flat_slots = slots[:, None].expand(-1, k, -1, -1).reshape(b * k, k, d)
     flat_masks = masks.reshape(b * k, k)
@@ -313,6 +339,12 @@ def main() -> None:
         raw_slots, attn = encode_raw_slots(backbone, images, device)
         slots = project_slots(projector, args.variant, raw_slots, slothead_mode)
         ranked = rank_slots(model, slots, labels, args.rank_score)
+        ranked_tensor = torch.tensor(ranked, dtype=torch.long, device=device)
+        predictions = {}
+        for top_k in args.top_ks:
+            selected_mask = torch.zeros(slots.size(0), slots.size(1), dtype=torch.bool, device=device)
+            selected_mask.scatter_(1, ranked_tensor[:, :top_k], True)
+            predictions[top_k] = model(slots, selected_mask).argmax(dim=1).detach().cpu()
         batch = labels.numel()
         for b in range(batch):
             sample_idx = base_indices[cursor + b]
@@ -347,6 +379,7 @@ def main() -> None:
                 evidence_hit, evidence_mass = hit_stats(heatmaps, top_slots, evidence_mask, args.hit_threshold, args.threshold_rel)
                 _union_hit, union_mass = hit_stats(heatmaps, top_slots, union_mask, args.hit_threshold, args.threshold_rel)
                 row[f"top{top_k}_slots_1based"] = json.dumps([slot_id + 1 for slot_id in top_slots])
+                row[f"accuracy@{top_k}"] = float(int(predictions[top_k][b]) == row["true"])
                 row[f"anchor@{top_k}"] = float(anchor_hit)
                 row[f"evidence@{top_k}"] = float(evidence_hit)
                 row[f"pair@{top_k}"] = float(anchor_hit and evidence_hit)
@@ -363,6 +396,7 @@ def main() -> None:
     for top_k in args.top_ks:
         metric_keys.extend(
             [
+                f"accuracy@{top_k}",
                 f"anchor@{top_k}",
                 f"evidence@{top_k}",
                 f"pair@{top_k}",

@@ -24,6 +24,7 @@ class GRPOSelectorConfig:
     first_step_cross_attention: bool = False
     first_step_num_heads: int = 4
     policy_context_attention: bool = False
+    num_components: int = 0
 
     def __post_init__(self) -> None:
         if self.max_steps <= 0:
@@ -100,6 +101,7 @@ class SlotSelectorGRPO(nn.Module):
             nn.Dropout(cfg.dropout),
             nn.Linear(cfg.hidden_dim, cfg.num_classes),
         )
+        self.component_head = nn.Linear(cfg.hidden_dim, cfg.num_components) if cfg.num_components > 0 else None
 
     def embed_slots(self, slots: torch.Tensor, slot_pos: Optional[torch.Tensor] = None) -> torch.Tensor:
         if self.cfg.pos_dim > 0:
@@ -176,6 +178,11 @@ class SlotSelectorGRPO(nn.Module):
         h: torch.Tensor,
     ) -> torch.Tensor:
         return self.classifier(h)
+
+    def classify_components(self, slot_embeds: torch.Tensor) -> torch.Tensor:
+        if self.component_head is None:
+            raise RuntimeError("component_head is disabled")
+        return self.component_head(slot_embeds)
 
     def mask_order_logits(self, slot_embeds: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         b, k, _ = slot_embeds.shape

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BBox evaluation for GRPO80 selector-chosen slots at @3 and @4."""
+"""BBox evaluation for AC80 selector-chosen slots at @3 and @4."""
 
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ def parse_top_ks(raw: str) -> list[int]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run_dir", required=True)
-    parser.add_argument("--checkpoint", default="selector_grpo_best.pt")
+    parser.add_argument("--checkpoint", default="selector_ac_best.pt")
     parser.add_argument("--data", default="")
     parser.add_argument("--split", default="test", choices=["valid", "val", "test"])
     parser.add_argument("--coco_root", default="/vol/biomedic3/kw1025/dinosaur/dataset/coco2017")
@@ -216,7 +216,7 @@ def main() -> None:
         raise ValueError("Missing data, sa_checkpoint, or slothead_checkpoint; pass them explicitly.")
 
     top_k_max = max(args.top_ks)
-    out_dir = Path(args.out_dir) if args.out_dir else run_dir / "visualizations" / f"{split}_grpo80_bbox_at3_at4"
+    out_dir = Path(args.out_dir) if args.out_dir else run_dir / "visualizations" / f"{split}_ac80_bbox_at3_at4"
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "contact_sheets").mkdir(exist_ok=True)
 
@@ -251,7 +251,7 @@ def main() -> None:
     contact_rows = []
     contact_counts_by_class: dict[int, int] = defaultdict(int)
     cursor = 0
-    for images, labels in tqdm(loader, desc="grpo80-bbox-eval", mininterval=1.0):
+    for images, labels in tqdm(loader, desc="ac80-bbox-eval", mininterval=1.0):
         labels = labels.to(device, non_blocking=device.type == "cuda")
         slots80, attn = encode_slots80(backbone, projector, images, device, slothead_mode)
         out, selected_by_item = selector_selected_slots(model, slots80, controls, confidence_early_exit)
@@ -313,7 +313,7 @@ def main() -> None:
             else:
                 should_save_contact = len(contact_rows) < args.contact_sheets
             if should_save_contact:
-                fname = f"{split}_idx{cursor + b:05d}_true{row['true']}_pred{row['pred']}_grpo80_bbox.png"
+                fname = f"{split}_idx{cursor + b:05d}_true{row['true']}_pred{row['pred']}_ac80_bbox.png"
                 save_selector_contact_sheet(
                     out_dir / "contact_sheets" / fname,
                     images[b].detach().cpu(),
@@ -327,7 +327,7 @@ def main() -> None:
                 contact_counts_by_class[class_id] += 1
         cursor += batch
 
-    write_csv(out_dir / "grpo80_bbox_eval.csv", rows)
+    write_csv(out_dir / "ac80_bbox_eval.csv", rows)
     write_csv(out_dir / "contact_sheet_index.csv", contact_rows)
     metric_keys = ["selector_correct"]
     for top_k in args.top_ks:
@@ -357,21 +357,21 @@ def main() -> None:
         "hit_threshold": args.hit_threshold,
         "threshold_rel": args.threshold_rel,
         "bbox_is_test_only": True,
-        "selection_source": "GRPO80 greedy selected slots",
+        "selection_source": "AC80 greedy selected slots",
         "metrics": metric_summary(rows, metric_keys),
         "per_class": {
             class_key: {"items": len(class_rows), "metrics": metric_summary(class_rows, metric_keys)}
             for class_key, class_rows in sorted(rows_by_class.items(), key=lambda item: int(item[0].split(":", 1)[0]))
         },
         "outputs": {
-            "csv": str(out_dir / "grpo80_bbox_eval.csv"),
+            "csv": str(out_dir / "ac80_bbox_eval.csv"),
             "contact_sheet_index": str(out_dir / "contact_sheet_index.csv"),
             "contact_sheets": str(out_dir / "contact_sheets"),
         },
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
-    html = ["<html><body><h1>GRPO80 BBox Evaluation @3/@4</h1>"]
+    html = ["<html><body><h1>AC80 BBox Evaluation @3/@4</h1>"]
     html.append("<pre>" + json.dumps(summary, indent=2) + "</pre>")
     for rec in contact_rows:
         html.append(

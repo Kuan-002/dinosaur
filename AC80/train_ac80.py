@@ -35,6 +35,23 @@ DEFAULT_SA = "/vol/biomedic3/kw1025/dinosaur/checkpoints/sa_coco_full_20260623_0
 DEFAULT_SLOTHEAD80 = "/vol/biomedic3/kw1025/dinosaur/SET80/checkpoints/slothead80_obj16_geo16_res48_20260709_192454/slothead_best.pt"
 
 
+class SlotSelectorAC(SlotSelectorGRPO):
+    """Actor-critic variant using the same slot-selection policy network as GRPO80."""
+
+    def __init__(self, cfg: GRPOSelectorConfig):
+        super().__init__(cfg)
+        self.value_head = nn.Sequential(
+            nn.LayerNorm(cfg.hidden_dim),
+            nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(cfg.hidden_dim, 1),
+        )
+
+    def value(self, h: torch.Tensor) -> torch.Tensor:
+        return self.value_head(h).squeeze(-1)
+
+
 def class_names_from_dataset(dataset) -> list[str]:
     while hasattr(dataset, "dataset"):
         dataset = dataset.dataset
@@ -169,7 +186,7 @@ def slothead_terminal_reward(
 
 
 def rollout_slothead_reward(
-    model: SlotSelectorGRPO,
+    model: SlotSelectorAC,
     slots: torch.Tensor,
     reward_features: dict[str, torch.Tensor],
     args: argparse.Namespace,
@@ -183,12 +200,14 @@ def rollout_slothead_reward(
     stopped = torch.zeros(b, dtype=torch.bool, device=slots.device)
     log_probs = []
     entropies = []
+    values = []
     actions = []
     masks = []
     min_steps = int(args.min_steps)
 
     for step in range(min(args.max_steps, k)):
         can_stop = (selected.sum(dim=1) >= min_steps) | ~active
+        step_value = model.value(h.detach())
         if model.cfg.decoupled_stop_policy:
             stop_logits = model.stop_head(h.detach()).squeeze(-1)
             stop_dist = Bernoulli(logits=stop_logits)
@@ -218,6 +237,7 @@ def rollout_slothead_reward(
         do_select = active & ~is_stop
         log_probs.append(step_log_prob)
         entropies.append(step_entropy)
+        values.append(step_value)
         actions.append(action)
         masks.append(active_f)
         h, selected = model.update_with_action(h, selected, slot_embeds, action, do_select)
@@ -230,11 +250,13 @@ def rollout_slothead_reward(
         action_t = torch.stack(actions, dim=1)
         log_prob_t = torch.stack(log_probs, dim=1)
         entropy_t = torch.stack(entropies, dim=1)
+        value_t = torch.stack(values, dim=1)
         mask_t = torch.stack(masks, dim=1)
     else:
         action_t = torch.empty(b, 0, dtype=torch.long, device=slots.device)
         log_prob_t = slots.new_zeros((b, 0))
         entropy_t = slots.new_zeros((b, 0))
+        value_t = slots.new_zeros((b, 0))
         mask_t = slots.new_zeros((b, 0))
     logits = model.classify(h)
     terminal_reward, reward_parts = slothead_terminal_reward(selected, reward_features, args, stopped, action_t, model.stop_idx)
@@ -245,6 +267,7 @@ def rollout_slothead_reward(
         "mask": mask_t,
         "log_probs": log_prob_t,
         "entropies": entropy_t,
+        "values": value_t,
         "terminal_reward": terminal_reward,
         "trajectory_reward": terminal_reward,
         "stopped": stopped.detach(),
@@ -253,41 +276,33 @@ def rollout_slothead_reward(
     }
 
 
-def grpo_loss_slothead_reward(
-    model: SlotSelectorGRPO,
+def ac_loss_slothead_reward(
+    model: SlotSelectorAC,
     slots: torch.Tensor,
     reward_features: dict[str, torch.Tensor],
     labels: torch.Tensor,
     args: argparse.Namespace,
 ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
-    batch_size = labels.numel()
-    group_size = int(args.grpo_group_size)
-    slots_rep = slots.repeat_interleave(group_size, dim=0)
-    labels_rep = labels.repeat_interleave(group_size, dim=0)
-    reward_features_rep = {key: value.repeat_interleave(group_size, dim=0) for key, value in reward_features.items()}
-    out = rollout_slothead_reward(model, slots_rep, reward_features_rep, args, sample=True)
-    advantages = grpo.grpo_group_advantages(
-        out["trajectory_reward"],
-        batch_size=batch_size,
-        group_size=group_size,
-        eps=float(args.grpo_adv_eps),
-    )
-    seq_log_prob = (out["log_probs"] * out["mask"]).sum(dim=1)
+    out = rollout_slothead_reward(model, slots, reward_features, args, sample=True)
+    reward = out["trajectory_reward"]
+    value_targets = reward[:, None].expand_as(out["values"])
+    advantages = value_targets - out["values"].detach()
     active_steps = out["mask"].sum().clamp_min(1.0)
-    policy_loss = -(seq_log_prob * advantages).mean()
+    policy_loss = -((out["log_probs"] * advantages * out["mask"]).sum() / active_steps)
+    value_loss = (((out["values"] - value_targets.detach()) ** 2) * out["mask"]).sum() / active_steps
     entropy_loss = -((out["entropies"] * out["mask"]).sum() / active_steps)
-    cls_loss = F.cross_entropy(out["logits"], labels_rep, label_smoothing=float(args.label_smoothing))
-    return out, cls_loss, policy_loss, entropy_loss
+    cls_loss = F.cross_entropy(out["logits"], labels, label_smoothing=float(args.label_smoothing))
+    return out, cls_loss, policy_loss, value_loss, entropy_loss
 
 
 def run_epoch(
-    model: SlotSelectorGRPO,
+    model: SlotSelectorAC,
     backbone,
     projector,
     loader,
     device: torch.device,
     ce_optimizer,
-    policy_optimizer,
+    actor_critic_optimizer,
     args: argparse.Namespace,
     train: bool,
 ) -> dict[str, float]:
@@ -314,24 +329,24 @@ def run_epoch(
             out = grpo.forced_warmup_rollout(model, slots, None, args)
             loss = float(args.classification_coef) * F.cross_entropy(out["logits"], labels, label_smoothing=args.label_smoothing)
         elif train:
-            out, cls_loss, policy_loss, entropy_loss = grpo_loss_slothead_reward(model, slots, reward_features, labels, args)
+            out, cls_loss, policy_loss, value_loss, entropy_loss = ac_loss_slothead_reward(model, slots, reward_features, labels, args)
             loss = (
                 float(args.classification_coef) * cls_loss
                 + args.policy_coef * policy_loss
+                + args.value_coef * value_loss
                 + args.entropy_coef * entropy_loss
             )
-            metric_labels = labels.repeat_interleave(int(args.grpo_group_size))
         else:
             with torch.no_grad():
                 out = rollout_slothead_reward(model, slots, reward_features, args, sample=False)
                 loss = float(args.classification_coef) * F.cross_entropy(out["logits"], labels, label_smoothing=args.label_smoothing)
         if train:
             ce_optimizer.zero_grad(set_to_none=True)
-            policy_optimizer.zero_grad(set_to_none=True)
+            actor_critic_optimizer.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             ce_optimizer.step()
-            policy_optimizer.step()
+            actor_critic_optimizer.step()
 
         with torch.no_grad():
             probs = out["logits"].softmax(dim=1).gather(1, metric_labels[:, None]).squeeze(1)
@@ -365,12 +380,12 @@ def write_history(path: Path, rows: list[dict]) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train RNN-GRPO selector over 80-dim slothead features.")
+    parser = argparse.ArgumentParser(description="Train RNN actor-critic selector over 80-dim slothead features.")
     parser.add_argument("--data", default=DEFAULT_DATA)
     parser.add_argument("--sa_checkpoint", default=DEFAULT_SA)
     parser.add_argument("--slothead_checkpoint", default=DEFAULT_SLOTHEAD80)
     parser.add_argument("--slothead_mode", choices=["u", "obj", "geo", "res", "obj_geo", "obj_res", "geo_res"], default="u")
-    parser.add_argument("--output_dir", default="GRPO80/checkpoints/grpo80")
+    parser.add_argument("--output_dir", default="AC80/checkpoints/ac80")
     parser.add_argument("--input_res", type=int, default=224)
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--warmup_epochs", type=int, default=1)
@@ -392,8 +407,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy_context_attention", action="store_true", default=True)
     parser.add_argument("--no_policy_context_attention", dest="policy_context_attention", action="store_false")
     parser.add_argument("--first_step_num_heads", type=int, default=4)
-    parser.add_argument("--grpo_group_size", type=int, default=4)
-    parser.add_argument("--grpo_adv_eps", type=float, default=1e-4)
     parser.add_argument("--free_slots", type=int, default=4)
     parser.add_argument("--min_free_slots", type=int, default=3)
     parser.add_argument("--max_free_slots", type=int, default=4)
@@ -408,6 +421,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--good_stop_res_threshold", type=float, default=0.35)
     parser.add_argument("--geometry_grid_size", type=int, default=14)
     parser.add_argument("--policy_coef", type=float, default=1.0)
+    parser.add_argument("--value_coef", type=float, default=0.5)
     parser.add_argument("--entropy_coef", type=float, default=0.01)
     parser.add_argument("--label_smoothing", type=float, default=0.05)
     parser.add_argument("--confidence_penalty", type=float, default=0.03)
@@ -422,8 +436,6 @@ def parse_args() -> argparse.Namespace:
     args.pos_dim = 0
     args.first_step_cross_attention = False
     args.warmup_policy = "random"
-    if args.grpo_group_size <= 1:
-        raise ValueError("--grpo_group_size must be greater than 1 for GRPO")
     if args.geometry_grid_size <= 0:
         raise ValueError("--geometry_grid_size must be positive")
     return args
@@ -437,7 +449,7 @@ def main() -> None:
     train_set = subset_dataset(build_dataset(args.data, "train", tfm["train"]), args.quick_limit_train, args.seed)
     valid_set = subset_dataset(build_dataset(args.data, "valid", tfm["valid"]), args.quick_limit_val, args.seed)
     if not args.slothead_checkpoint:
-        raise ValueError("--slothead_checkpoint is required for GRPO80; pass a fresh object-mode slothead checkpoint for the current dataset.")
+        raise ValueError("--slothead_checkpoint is required for AC80; pass a fresh object-mode slothead checkpoint for the current dataset.")
     classes = class_names_from_dataset(train_set)
     if not classes:
         raise RuntimeError("Could not infer class names from dataset.")
@@ -468,24 +480,25 @@ def main() -> None:
         first_step_num_heads=args.first_step_num_heads,
         policy_context_attention=args.policy_context_attention,
     )
-    model = SlotSelectorGRPO(cfg).to(device)
+    model = SlotSelectorAC(cfg).to(device)
     ce_params = grpo.ce_parameters(model)
-    policy_params = grpo.policy_parameters(model)
+    actor_critic_params = [*grpo.policy_parameters(model), *model.value_head.parameters()]
     ce_ids = {id(param) for param in ce_params}
-    policy_ids = {id(param) for param in policy_params}
-    if ce_ids & policy_ids:
-        raise ValueError("CE and policy parameter groups overlap")
-    missing = {id(param) for param in model.parameters()} - ce_ids - policy_ids
+    actor_critic_ids = {id(param) for param in actor_critic_params}
+    if ce_ids & actor_critic_ids:
+        raise ValueError("CE and actor-critic parameter groups overlap")
+    missing = {id(param) for param in model.parameters()} - ce_ids - actor_critic_ids
     if missing:
         raise ValueError(f"Some parameters are not assigned to optimizers: {len(missing)}")
     ce_optimizer = torch.optim.AdamW(ce_params, lr=args.lr, weight_decay=args.wd)
-    policy_optimizer = torch.optim.AdamW(policy_params, lr=args.lr, weight_decay=args.wd)
+    actor_critic_optimizer = torch.optim.AdamW(actor_critic_params, lr=args.lr, weight_decay=args.wd)
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     meta = {
         "args": vars(args),
         "grpo_config": asdict(cfg),
+        "ac_config": asdict(cfg),
         "classes": classes,
         "slot_embedding_source": "slothead80",
         "slothead80_config": slothead_ckpt["config"],
@@ -504,9 +517,9 @@ def main() -> None:
             "good_stop_res_threshold": args.good_stop_res_threshold,
             "geometry_grid_size": args.geometry_grid_size,
         },
-        "design_note": "Slothead80 supplies u=[u_obj,u_geo,u_res]. Reward is label-free: objectness keeps selected slots object-like, geometry rewards objectness-weighted incremental non-overlap coverage, residual novelty rewards non-duplicate u_res evidence. Scene labels are used only in CE loss.",
+        "design_note": "Slothead80 supplies u=[u_obj,u_geo,u_res]. AC80 keeps the GRPO80 policy slot-selection cross-attention mode but replaces group-relative GRPO advantages with a learned value baseline. Reward is label-free: objectness keeps selected slots object-like, geometry rewards objectness-weighted incremental non-overlap coverage, residual novelty rewards non-duplicate u_res evidence. Scene labels are used only in CE loss.",
     }
-    (out_dir / "selector_grpo_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    (out_dir / "selector_ac_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     print(f"device={device} train={len(train_set)} valid={len(valid_set)} classes={len(classes)} slot_dim={slot_dim}")
     print(f"slothead80={args.slothead_checkpoint} mode={args.slothead_mode}")
 
@@ -515,10 +528,10 @@ def main() -> None:
     start = time.time()
     for epoch in range(1, args.epochs + 1):
         args.warmup_epochs_remaining = max(args.warmup_epochs - epoch + 1, 0)
-        train_metrics = run_epoch(model, backbone, projector, train_loader, device, ce_optimizer, policy_optimizer, args, True)
+        train_metrics = run_epoch(model, backbone, projector, train_loader, device, ce_optimizer, actor_critic_optimizer, args, True)
         args.warmup_epochs_remaining = 0
         with torch.no_grad():
-            valid_metrics = run_epoch(model, backbone, projector, valid_loader, device, ce_optimizer, policy_optimizer, args, False)
+            valid_metrics = run_epoch(model, backbone, projector, valid_loader, device, ce_optimizer, actor_critic_optimizer, args, False)
         row = {
             "epoch": epoch,
             "elapsed": time.strftime("%H:%M:%S", time.gmtime(time.time() - start)),
@@ -541,11 +554,11 @@ def main() -> None:
                     "valid_acc": best_acc,
                     "model_state_dict": model.state_dict(),
                     "ce_optimizer_state_dict": ce_optimizer.state_dict(),
-                    "policy_optimizer_state_dict": policy_optimizer.state_dict(),
+                    "actor_critic_optimizer_state_dict": actor_critic_optimizer.state_dict(),
                 },
-                out_dir / "selector_grpo_best.pt",
+                out_dir / "selector_ac_best.pt",
             )
-            print(f"saved best selector: {out_dir / 'selector_grpo_best.pt'}")
+            print(f"saved best selector: {out_dir / 'selector_ac_best.pt'}")
     (out_dir / "final_metrics.json").write_text(json.dumps({"best_valid_acc": best_acc, "history": history}, indent=2), encoding="utf-8")
 
 

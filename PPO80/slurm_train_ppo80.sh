@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=grpo80
+#SBATCH --job-name=ppo80
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 #SBATCH --partition=gpus24
@@ -9,10 +9,10 @@
 set -euo pipefail
 
 cd /vol/biomedic3/kw1025/dinosaur
-mkdir -p logs GRPO80/checkpoints
+mkdir -p logs PPO80/checkpoints
 
-RUN_NAME="${RUN_NAME:-grpo80_slothead_u_rewardv3_acc_steps_$(date +%Y%m%d_%H%M%S)}"
-OUT_DIR="${OUT_DIR:-GRPO80/checkpoints/${RUN_NAME}}"
+RUN_NAME="${RUN_NAME:-ppo80_slothead_u_rewardv3_acc_steps_$(date +%Y%m%d_%H%M%S)}"
+OUT_DIR="${OUT_DIR:-PPO80/checkpoints/${RUN_NAME}}"
 PYTHON="${PYTHON:-.venv/bin/python}"
 
 SLOTHEAD80_CHECKPOINT="${SLOTHEAD80_CHECKPOINT:-/vol/biomedic3/kw1025/dinosaur/SET80/checkpoints/slothead80_obj16_geo16_res48_20260709_192454/slothead_best.pt}"
@@ -22,7 +22,7 @@ if [[ -z "${SLOTHEAD80_CHECKPOINT}" ]]; then
   exit 2
 fi
 
-"${PYTHON}" GRPO80/train_grpo80.py \
+"${PYTHON}" PPO80/train_ppo80.py \
   --output_dir "${OUT_DIR}" \
   --data "${DATA:-/vol/biomedic3/kw1025/dinosaur/dataset/coco_top2_clean10_area006_004_600_200_200/classification_dataset}" \
   --sa_checkpoint "${SA_CHECKPOINT:-/vol/biomedic3/kw1025/dinosaur/checkpoints/sa_coco_full_20260623_004920/checkpoint_best_mbo_i_slots.pt}" \
@@ -37,7 +37,10 @@ fi
   --wd "${WD:-1e-4}" \
   --max_steps "${MAX_STEPS:-8}" \
   --min_steps "${MIN_STEPS:-2}" \
-  --grpo_group_size "${GRPO_GROUP_SIZE:-4}" \
+  --ppo_epochs "${PPO_EPOCHS:-4}" \
+  --ppo_clip_eps "${PPO_CLIP_EPS:-0.20}" \
+  --ppo_log_ratio_clip "${PPO_LOG_RATIO_CLIP:-10.0}" \
+  --value_coef "${VALUE_COEF:-0.50}" \
   --free_slots "${FREE_SLOTS:-4}" \
   --min_free_slots "${MIN_FREE_SLOTS:-3}" \
   --max_free_slots "${MAX_FREE_SLOTS:-4}" \
@@ -59,4 +62,4 @@ fi
   --early_confidence_penalty_until_slots "${EARLY_CONFIDENCE_PENALTY_UNTIL_SLOTS:-3}" \
   --seed "${SEED:-8}"
 
-echo "GRPO80 checkpoint: ${OUT_DIR}/selector_grpo_best.pt"
+echo "PPO80 checkpoint: ${OUT_DIR}/selector_ppo_best.pt"
