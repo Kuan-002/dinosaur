@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate forced @3/@4 GRPO6 slot rankings against COCO object boxes."""
+"""Evaluate forced top-k GRPO6 rankings with standard bbox hit metrics."""
 
 from __future__ import annotations
 
@@ -11,19 +11,15 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-os.environ.setdefault("TORCH_HOME", str(REPO_ROOT / ".cache" / "torch"))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "GRPO6-factorized"))
+os.environ.setdefault("TORCH_HOME", str(ROOT / ".cache" / "torch"))
 
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
 
-from selector_grpo import GRPOSelectorConfig, SlotSelectorGRPO
-from train_slot_classifier import build_dataset, build_transforms, load_backbone
 from scripts.evaluate_set_bbox import (
     boxes_to_mask,
     hit_stats,
@@ -31,28 +27,40 @@ from scripts.evaluate_set_bbox import (
     load_metadata,
     make_heatmaps,
     metric_summary,
+    sample_relative_path,
     transform_boxes_to_input,
     unwrap_dataset,
 )
+from selector_grpo import GRPOSelectorConfig, SlotSelectorGRPO
+from train_slot_classifier import build_dataset, build_transforms, load_backbone
 
 
-DEFAULT_RUN = REPO_ROOT / "GRPO6-factorized/checkpoints/grpo6_factorized_m3_p085_n090_seed8_20260715"
-DEFAULT_DATA = REPO_ROOT / "dataset/coco_compositional_pair6_clean_300_100_100/classification_dataset"
-DEFAULT_COCO = REPO_ROOT / "dataset/coco2017"
+def comma_ints(value: str) -> list[int]:
+    return sorted({int(item) for item in value.split(",") if item.strip()})
 
 
-def parse_float_list(raw: str) -> list[float]:
-    values = sorted({float(part.strip()) for part in raw.split(",") if part.strip()})
-    if not values or any(not 0.0 <= value <= 1.0 for value in values):
-        raise ValueError("thresholds must be comma-separated values in [0, 1]")
-    return values
+def comma_floats(value: str) -> list[float]:
+    return sorted({float(item) for item in value.split(",") if item.strip()})
 
 
-def parse_int_list(raw: str) -> list[int]:
-    values = sorted({int(part.strip()) for part in raw.split(",") if part.strip()})
-    if not values or any(value <= 0 for value in values):
-        raise ValueError("top-k values must be positive integers")
-    return values
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run_dir", required=True)
+    parser.add_argument("--checkpoint", default="selector_grpo_best.pt")
+    parser.add_argument("--data", default="")
+    parser.add_argument("--sa_checkpoint", default="")
+    parser.add_argument("--coco_root", default=str(ROOT / "dataset/coco2017"))
+    parser.add_argument("--split", choices=("valid", "test"), default="test")
+    parser.add_argument("--out_dir", default="")
+    parser.add_argument("--top_ks", type=comma_ints, default=comma_ints("2,3,4"))
+    parser.add_argument("--hit_thresholds", type=comma_floats, default=comma_floats("0.2,0.4"))
+    parser.add_argument("--threshold_rel", type=float, default=0.5)
+    parser.add_argument("--input_res", type=int, default=224)
+    parser.add_argument("--bs", type=int, default=32)
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--max_items", type=int, default=0)
+    parser.add_argument("--device", default="auto")
+    return parser.parse_args()
 
 
 def choose_device(raw: str) -> torch.device:
@@ -67,238 +75,170 @@ def dataset_indices(dataset: Dataset) -> list[int]:
     return list(range(len(dataset)))
 
 
-def relative_path(base_dataset: Dataset, sample_idx: int, split: str) -> str:
-    sample_path = Path(base_dataset.samples[sample_idx][0])
-    root = Path(getattr(base_dataset, "root"))
-    rel = sample_path.relative_to(root).as_posix()
-    return rel if rel.startswith(f"{split}/") else f"{split}/{rel}"
-
-
-def load_selector(checkpoint_path: Path, device: torch.device) -> tuple[SlotSelectorGRPO, dict]:
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    config = GRPOSelectorConfig(**checkpoint["config"])
-    model = SlotSelectorGRPO(config).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-    return model, checkpoint
-
-
 @torch.no_grad()
-def encode_raw_slots(backbone, images: torch.Tensor, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+def encode(backbone, images: torch.Tensor, device: torch.device):
     images = images.to(device, non_blocking=device.type == "cuda")
-    features = backbone.forward_dino(images)
-    features = backbone.mlp(features)
-    slots, attn, _ = backbone.slot_attention(features)
-    return slots.detach(), attn.detach()
+    features = backbone.mlp(backbone.forward_dino(images))
+    slots, attention, _ = backbone.slot_attention(features)
+    return slots.detach(), attention.detach()
 
 
 @torch.no_grad()
-def force_rank_slots(
-    model: SlotSelectorGRPO,
-    slots: torch.Tensor,
-    max_k: int,
-) -> tuple[list[list[int]], dict[int, torch.Tensor]]:
-    """Greedily select exactly max_k slots, ignoring confidence early exit."""
-    slot_embeds = model.embed_slots(slots, None)
-    batch_size, num_slots, _ = slot_embeds.shape
+def forced_ranking(model: SlotSelectorGRPO, slots: torch.Tensor, max_k: int):
+    embeds = model.embed_slots(slots, None)
+    batch, num_slots, _ = embeds.shape
     if max_k > num_slots:
         raise ValueError(f"requested top-{max_k}, but model only has {num_slots} slots")
-    h = model.initial_state(slot_embeds)
-    selected = torch.zeros(batch_size, num_slots, dtype=torch.bool, device=slots.device)
-    actions: list[torch.Tensor] = []
-    logits_by_k: dict[int, torch.Tensor] = {}
-    active = torch.ones(batch_size, dtype=torch.bool, device=slots.device)
+    hidden = model.initial_state(embeds)
+    selected = torch.zeros(batch, num_slots, dtype=torch.bool, device=slots.device)
+    active = torch.ones(batch, dtype=torch.bool, device=slots.device)
+    actions, logits_by_k = [], {}
     for step in range(max_k):
-        policy_logits = model.slot_policy_logits(h, slot_embeds, selected, step)
-        action = policy_logits.argmax(dim=-1)
-        h, selected = model.update_with_action(h, selected, slot_embeds, action, active)
+        action = model.slot_policy_logits(hidden, embeds, selected, step).argmax(dim=1)
+        hidden, selected = model.update_with_action(hidden, selected, embeds, action, active)
         actions.append(action)
-        logits_by_k[step + 1] = model.classify(h).detach()
-    action_tensor = torch.stack(actions, dim=1).detach().cpu()
-    return [[int(slot) for slot in row] for row in action_tensor.tolist()], logits_by_k
-
-
-def needed_box_keys(metadata: dict[str, dict[str, str]], dataset: Dataset, split: str) -> set[tuple[str, int, str]]:
-    base = unwrap_dataset(dataset)
-    keys: set[tuple[str, int, str]] = set()
-    for sample_idx in dataset_indices(dataset):
-        row = metadata[relative_path(base, sample_idx, split)]
-        source = row["source_split"]
-        image_id = int(row["image_id"])
-        keys.add((source, image_id, row["anchor_object"]))
-        keys.add((source, image_id, row["evidence_object"]))
-    return keys
+        logits_by_k[step + 1] = model.classify(hidden)
+    return torch.stack(actions, dim=1), logits_by_k
 
 
 def write_csv(path: Path, rows: list[dict]) -> None:
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
-
-
-def threshold_key(value: float) -> str:
-    return f"{value:g}"
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run_dir", default=str(DEFAULT_RUN))
-    parser.add_argument("--checkpoint", default="selector_grpo_best.pt")
-    parser.add_argument("--data", default=str(DEFAULT_DATA))
-    parser.add_argument("--coco_root", default=str(DEFAULT_COCO))
-    parser.add_argument("--sa_checkpoint", default="")
-    parser.add_argument("--split", choices=["valid", "test"], default="test")
-    parser.add_argument("--out_dir", default="")
-    parser.add_argument("--input_res", type=int, default=224)
-    parser.add_argument("--bs", type=int, default=32)
-    parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--top_ks", type=parse_int_list, default=parse_int_list("3,4"))
-    parser.add_argument("--hit_thresholds", type=parse_float_list, default=parse_float_list("0.2,0.4"))
-    parser.add_argument("--threshold_rel", type=float, default=0.5)
-    parser.add_argument("--max_items", type=int, default=0)
-    parser.add_argument("--device", default="auto")
-    return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     device = choose_device(args.device)
     run_dir = Path(args.run_dir)
-    model, checkpoint = load_selector(run_dir / args.checkpoint, device)
+    checkpoint_path = run_dir / args.checkpoint
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     checkpoint_args = checkpoint.get("args") or {}
+    data = args.data or checkpoint_args.get("data")
     sa_checkpoint = args.sa_checkpoint or checkpoint_args.get("sa_checkpoint")
-    if not sa_checkpoint:
-        raise ValueError("SA checkpoint is missing")
-    max_k = max(args.top_ks)
-    out_dir = Path(args.out_dir) if args.out_dir else run_dir / "bbox_eval_forced_top4"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if not data or not sa_checkpoint:
+        raise ValueError("data and sa_checkpoint are required")
 
-    transforms = build_transforms(args.input_res)
-    dataset = build_dataset(args.data, args.split, transforms["valid"])
+    dataset = build_dataset(data, args.split, build_transforms(args.input_res)["valid"])
     if args.max_items and args.max_items < len(dataset):
         dataset = Subset(dataset, list(range(args.max_items)))
     base_dataset = unwrap_dataset(dataset)
     base_indices = dataset_indices(dataset)
-    metadata = load_metadata(args.data)
-    coco_boxes = load_coco_boxes(Path(args.coco_root), needed_box_keys(metadata, dataset, args.split))
-    loader = DataLoader(
-        dataset,
-        batch_size=args.bs,
-        shuffle=False,
-        drop_last=False,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-        persistent_workers=args.num_workers > 0,
-    )
-    backbone = load_backbone(sa_checkpoint, device)
-    backbone.eval()
-    backbone.requires_grad_(False)
+    metadata = load_metadata(data)
+    rules = checkpoint["rules"]
+    needed = set()
+    for sample_idx in base_indices:
+        row = metadata[sample_relative_path(base_dataset, sample_idx, args.split)]
+        class_name = row["class_name"]
+        needed.add((row["source_split"], int(row["image_id"]), rules[class_name]["object_a"]))
+        needed.add((row["source_split"], int(row["image_id"]), rules[class_name]["object_b"]))
+    coco_boxes = load_coco_boxes(Path(args.coco_root), needed)
 
-    rows: list[dict] = []
+    loader = DataLoader(dataset, batch_size=args.bs, shuffle=False, num_workers=args.num_workers)
+    backbone = load_backbone(sa_checkpoint, device).eval()
+    backbone.requires_grad_(False)
+    model = SlotSelectorGRPO(GRPOSelectorConfig(**checkpoint["config"])).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+
+    rows = []
     cursor = 0
     for images, labels in tqdm(loader, desc="grpo6-factorized-bbox", mininterval=1.0):
-        labels_device = labels.to(device, non_blocking=device.type == "cuda")
-        slots, attn = encode_raw_slots(backbone, images, device)
-        ranked_slots, logits_by_k = force_rank_slots(model, slots, max_k)
-        predictions = {top_k: logits_by_k[top_k].argmax(dim=1).cpu() for top_k in args.top_ks}
-        for batch_index in range(labels.numel()):
-            sample_idx = base_indices[cursor + batch_index]
-            rel = relative_path(base_dataset, sample_idx, args.split)
-            meta = metadata[rel]
-            source = meta["source_split"]
+        labels = labels.to(device)
+        slots, attention = encode(backbone, images, device)
+        ranking, logits_by_k = forced_ranking(model, slots, max(args.top_ks))
+        ranking = ranking.cpu()
+        predictions = {k: logits_by_k[k].argmax(1).cpu() for k in args.top_ks}
+        for batch_idx in range(labels.numel()):
+            sample_idx = base_indices[cursor + batch_idx]
+            relative_path = sample_relative_path(base_dataset, sample_idx, args.split)
+            meta = metadata[relative_path]
             image_id = int(meta["image_id"])
+            source_split = meta["source_split"]
             width, height = int(meta["width"]), int(meta["height"])
-            anchor_name, evidence_name = meta["anchor_object"], meta["evidence_object"]
-            anchor_boxes = transform_boxes_to_input(
-                coco_boxes.get((source, image_id, anchor_name), []), width, height, args.input_res
+            true_id = int(labels[batch_idx].item())
+            class_name = meta["class_name"]
+            object_a_name = rules[class_name]["object_a"]
+            object_b_name = rules[class_name]["object_b"]
+            object_a_boxes = transform_boxes_to_input(
+                coco_boxes.get((source_split, image_id, object_a_name), []),
+                width,
+                height,
+                args.input_res,
             )
-            evidence_boxes = transform_boxes_to_input(
-                coco_boxes.get((source, image_id, evidence_name), []), width, height, args.input_res
+            object_b_boxes = transform_boxes_to_input(
+                coco_boxes.get((source_split, image_id, object_b_name), []),
+                width,
+                height,
+                args.input_res,
             )
-            anchor_mask = boxes_to_mask(anchor_boxes, args.input_res)
-            evidence_mask = boxes_to_mask(evidence_boxes, args.input_res)
-            heatmaps = make_heatmaps(attn[batch_index].cpu(), args.input_res)
+            object_a_mask = boxes_to_mask(object_a_boxes, args.input_res)
+            object_b_mask = boxes_to_mask(object_b_boxes, args.input_res)
+            heatmaps = make_heatmaps(attention[batch_idx].cpu(), args.input_res)
             row = {
-                "dataset_index": cursor + batch_index,
-                "relative_path": rel,
-                "true": int(labels[batch_index]),
-                "true_name": meta["class_name"],
+                "dataset_index": cursor + batch_idx,
+                "relative_path": relative_path,
+                "true": true_id,
+                "true_name": class_name,
                 "image_id": image_id,
-                "source_split": source,
-                "object_a": meta["object_a"],
-                "object_b": meta["object_b"],
-                "anchor_object": anchor_name,
-                "evidence_object": evidence_name,
-                "ranked_slots_1based": json.dumps([slot + 1 for slot in ranked_slots[batch_index]]),
+                "source_split": source_split,
+                "object_a": object_a_name,
+                "object_b": object_b_name,
+                "ranked_slots_1based": json.dumps((ranking[batch_idx] + 1).tolist()),
             }
             for top_k in args.top_ks:
-                selected = ranked_slots[batch_index][:top_k]
-                row[f"selector_correct@{top_k}"] = float(predictions[top_k][batch_index] == labels[batch_index])
+                chosen = ranking[batch_idx, :top_k].tolist()
+                row[f"accuracy@{top_k}"] = float(int(predictions[top_k][batch_idx]) == true_id)
+                row[f"top{top_k}_slots_1based"] = json.dumps([slot + 1 for slot in chosen])
                 for threshold in args.hit_thresholds:
-                    key = threshold_key(threshold)
-                    anchor_hit, anchor_mass = hit_stats(
-                        heatmaps, selected, anchor_mask, threshold, args.threshold_rel
-                    )
-                    evidence_hit, evidence_mass = hit_stats(
-                        heatmaps, selected, evidence_mask, threshold, args.threshold_rel
-                    )
-                    row[f"anchor@{top_k}_thr{key}"] = float(anchor_hit)
-                    row[f"evidence@{top_k}_thr{key}"] = float(evidence_hit)
-                    row[f"pair@{top_k}_thr{key}"] = float(anchor_hit and evidence_hit)
-                    row[f"anchor_mass@{top_k}"] = anchor_mass
-                    row[f"evidence_mass@{top_k}"] = evidence_mass
+                    suffix = f"@{top_k}/thr{threshold:g}"
+                    object_a_hit, object_a_mass = hit_stats(heatmaps, chosen, object_a_mask, threshold, args.threshold_rel)
+                    object_b_hit, object_b_mass = hit_stats(heatmaps, chosen, object_b_mask, threshold, args.threshold_rel)
+                    row[f"object_a{suffix}"] = float(object_a_hit)
+                    row[f"object_b{suffix}"] = float(object_b_hit)
+                    row[f"pair{suffix}"] = float(object_a_hit and object_b_hit)
+                    row[f"object_a_mass{suffix}"] = object_a_mass
+                    row[f"object_b_mass{suffix}"] = object_b_mass
             rows.append(row)
         cursor += labels.numel()
 
-    write_csv(out_dir / "bbox_eval.csv", rows)
-    rows_by_class: dict[str, list[dict]] = defaultdict(list)
+    metric_keys = [f"accuracy@{k}" for k in args.top_ks]
+    for threshold in args.hit_thresholds:
+        for top_k in args.top_ks:
+            metric_keys += [f"{name}@{top_k}/thr{threshold:g}" for name in ("object_a", "object_b", "pair")]
+    rows_by_class = defaultdict(list)
     for row in rows:
         rows_by_class[f"{row['true']}:{row['true_name']}"].append(row)
-
-    metric_keys = [f"selector_correct@{top_k}" for top_k in args.top_ks]
-    for threshold in args.hit_thresholds:
-        key = threshold_key(threshold)
-        for top_k in args.top_ks:
-            metric_keys.extend(
-                [f"anchor@{top_k}_thr{key}", f"evidence@{top_k}_thr{key}", f"pair@{top_k}_thr{key}"]
-            )
-    overall_flat = metric_summary(rows, metric_keys)
+    out_dir = Path(args.out_dir) if args.out_dir else run_dir / "bbox_eval_forced_top2_top3_top4"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    flat = metric_summary(rows, metric_keys)
     summary = {
-        "run_dir": str(run_dir),
-        "checkpoint": args.checkpoint,
+        "checkpoint": str(checkpoint_path),
         "checkpoint_epoch": checkpoint.get("epoch"),
-        "checkpoint_valid_acc": checkpoint.get("valid_acc"),
-        "data": args.data,
+        "checkpoint_valid_pair_score": checkpoint.get("valid_pair_score"),
         "split": args.split,
         "items": len(rows),
         "top_ks": args.top_ks,
         "hit_thresholds": args.hit_thresholds,
         "threshold_rel": args.threshold_rel,
-        "forced_ranking": True,
-        "confidence_early_exit_used": False,
         "bbox_is_evaluation_only": True,
-        "classification": {f"acc@{top_k}": overall_flat[f"selector_correct@{top_k}"] for top_k in args.top_ks},
+        "classification": {f"acc@{top_k}": flat[f"accuracy@{top_k}"] for top_k in args.top_ks},
         "thresholds": {
-            threshold_key(threshold): {
-                f"anchor@{top_k}": overall_flat[f"anchor@{top_k}_thr{threshold_key(threshold)}"]
+            f"{threshold:g}": {
+                f"{metric}@{top_k}": flat[f"{metric}@{top_k}/thr{threshold:g}"]
                 for top_k in args.top_ks
+                for metric in ("object_a", "object_b", "pair")
             }
             for threshold in args.hit_thresholds
         },
-        "overall_flat": overall_flat,
+        "overall_flat": flat,
         "per_class": {
-            class_key: {"items": len(class_rows), "metrics": metric_summary(class_rows, metric_keys)}
-            for class_key, class_rows in sorted(rows_by_class.items(), key=lambda item: int(item[0].split(":", 1)[0]))
+            key: {"items": len(value), "metrics": metric_summary(value, metric_keys)}
+            for key, value in sorted(rows_by_class.items(), key=lambda item: int(item[0].split(":", 1)[0]))
         },
-        "csv": str(out_dir / "bbox_eval.csv"),
     }
-    # Add evidence/pair values next to anchor values in the compact threshold view.
-    for threshold in args.hit_thresholds:
-        key = threshold_key(threshold)
-        for top_k in args.top_ks:
-            summary["thresholds"][key][f"evidence@{top_k}"] = overall_flat[f"evidence@{top_k}_thr{key}"]
-            summary["thresholds"][key][f"pair@{top_k}"] = overall_flat[f"pair@{top_k}_thr{key}"]
+    write_csv(out_dir / "bbox_eval.csv", rows)
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2))
 

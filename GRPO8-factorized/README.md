@@ -9,9 +9,8 @@ from epoch 1:
 1. an auxiliary update trains the set classifier and the factorized A/E/P
    component heads with random partial slot sets, positive/unknown MIL, and
    pair cross-entropy;
-2. a GRPO update trains only the slot-ranking policy using anchor gain,
-   evidence-upweighted gain, distinct-slot pair completion, and rule-margin
-   rewards.
+2. a GRPO update trains only the slot-ranking policy using class-margin gain,
+   anchor gain, evidence-upweighted gain, and distinct-slot pair gain.
 
 DINOSAUR is frozen and bbox/mask annotations are used only by the final
 evaluation.

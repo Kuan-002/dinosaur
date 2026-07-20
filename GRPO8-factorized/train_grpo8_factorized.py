@@ -12,13 +12,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "GRPO10-factorized"))
 os.environ.setdefault("TORCH_HOME", str(ROOT / ".cache" / "torch"))
 
 import torch
 import torch.nn.functional as F
 
-import train_grpo10_factorized as fac
+import factorized_core as fac
 import train_grpo_selector as grpo
 from misc_utils import seed_all
 from selector_grpo import GRPOSelectorConfig, SlotSelectorGRPO
@@ -50,9 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--anchor_coef", type=float, default=0.25)
     parser.add_argument("--evidence_coef", type=float, default=2.0)
     parser.add_argument("--pair_coef", type=float, default=1.0)
-    parser.add_argument("--rule_margin_coef", type=float, default=0.5)
-    parser.add_argument("--completion_threshold", type=float, default=0.25)
-    parser.add_argument("--completion_bonus", type=float, default=0.5)
+    parser.add_argument("--class_margin_coef", type=float, default=1.0)
     parser.add_argument("--rank_discount", type=float, default=0.85)
     parser.add_argument("--grpo_group_size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=8)
@@ -63,38 +60,38 @@ def parse_args() -> argparse.Namespace:
 
 
 def auxiliary_loss(model, slots, labels, args, anchor_ids, evidence_ids, num_objects):
-    """Train A/E/P and the classifier on random partial sets every epoch."""
-    embeds = model.embed_slots(slots, None)
-    batch, num_slots, _ = embeds.shape
-    hidden = model.initial_state(embeds)
-    selected = torch.zeros(batch, num_slots, dtype=torch.bool, device=slots.device)
-    high = min(args.max_steps, num_slots)
-    low = min(args.min_steps, high)
-    counts = torch.randint(low, high + 1, (batch,), device=slots.device)
-    for step in range(high):
-        action = torch.rand(batch, num_slots, device=slots.device).masked_fill(selected, -1).argmax(1)
-        active = step < counts
-        hidden, selected = model.update_with_action(hidden, selected, embeds, action, active)
+    """Train component support heads and classifier on random partial sets."""
+    slot_embeds = model.embed_slots(slots, None)
+    batch, num_slots, _ = slot_embeds.shape
+    hidden = model.initial_state(slot_embeds)
+    selected_mask = torch.zeros(batch, num_slots, dtype=torch.bool, device=slots.device)
+    max_random_steps = min(args.max_steps, num_slots)
+    min_random_steps = min(args.min_steps, max_random_steps)
+    selected_counts = torch.randint(min_random_steps, max_random_steps + 1, (batch,), device=slots.device)
+    for step in range(max_random_steps):
+        action = torch.rand(batch, num_slots, device=slots.device).masked_fill(selected_mask, -1).argmax(1)
+        active_mask = step < selected_counts
+        hidden, selected_mask = model.update_with_action(hidden, selected_mask, slot_embeds, action, active_mask)
 
     class_logits = model.classify(hidden)
-    component_logits = model.classify_components(embeds)
+    slot_component_logits = model.classify_components(slot_embeds)
     targets = fac.component_targets(labels, anchor_ids, evidence_ids, num_objects)
-    image_component_logits = fac.mil_logits(component_logits, args.component_mil_temperature)
+    image_component_logits = fac.mil_logits(slot_component_logits, args.component_mil_temperature)
     if args.component_loss_mode == "positive_unknown":
         component_loss = -(F.logsigmoid(image_component_logits) * targets).sum() / targets.sum().clamp_min(1.0)
     else:
         component_loss = F.binary_cross_entropy_with_logits(image_component_logits, targets)
-    pair_logits = fac.all_pair_logits(
-        component_logits.sigmoid(), torch.ones_like(selected), anchor_ids, evidence_ids
+    rule_pair_logits = fac.rule_pair_logits(
+        slot_component_logits.sigmoid(), torch.ones_like(selected_mask), anchor_ids, evidence_ids
     )
     class_loss = F.cross_entropy(class_logits, labels)
-    pair_loss = F.cross_entropy(pair_logits, labels)
+    pair_ce_loss = F.cross_entropy(rule_pair_logits, labels)
     total = (
         args.classification_coef * class_loss
         + args.component_mil_coef * component_loss
-        + args.pair_ce_coef * pair_loss
+        + args.pair_ce_coef * pair_ce_loss
     )
-    return total, class_logits, class_loss.detach(), component_loss.detach(), pair_loss.detach()
+    return total, class_logits, class_loss.detach(), component_loss.detach(), pair_ce_loss.detach()
 
 
 def main() -> None:
@@ -111,7 +108,8 @@ def main() -> None:
         base = base.dataset
     classes = list(base.classes)
     objects, anchor_ids, evidence_ids, rules = fac.load_rules(args.data, classes)
-    anchor_ids, evidence_ids = anchor_ids.to(device), evidence_ids.to(device)
+    anchor_ids = anchor_ids.to(device)
+    evidence_ids = evidence_ids.to(device)
     train_loader = grpo.make_loader(train_set, args, device, shuffle=True)
     valid_loader = grpo.make_loader(valid_set, args, device, shuffle=False)
     backbone = load_backbone(args.sa_checkpoint, device).eval()
@@ -140,7 +138,7 @@ def main() -> None:
         "args": vars(args), "config": asdict(config), "classes": classes,
         "objects": objects, "rules": rules, "uses_bbox": False,
         "training_schedule": "joint auxiliary + GRPO from epoch 1; no warmup",
-        "selection_objective": "evidence-upweighted distinct-slot factorized pair@k",
+        "selection_objective": "class-margin GRPO plus evidence-upweighted factorized anchor/evidence/pair increments",
     }
     (output / "experiment_meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
 
@@ -154,7 +152,7 @@ def main() -> None:
             slots = fac.encode(backbone, images, device)
 
             auxiliary_optimizer.zero_grad(set_to_none=True)
-            aux_loss, class_logits, class_loss, component_loss, pair_loss = auxiliary_loss(
+            aux_loss, class_logits, class_loss, component_loss, pair_ce_loss = auxiliary_loss(
                 model, slots, labels, args, anchor_ids, evidence_ids, len(objects)
             )
             aux_loss.backward()
@@ -164,15 +162,15 @@ def main() -> None:
             group = args.grpo_group_size
             repeated_slots = slots.repeat_interleave(group, 0)
             repeated_labels = labels.repeat_interleave(group, 0)
-            result = fac.rollout(model, repeated_slots, repeated_labels, args, True, anchor_ids, evidence_ids)
-            mask = result["mask"]
+            rollout = fac.rollout(model, repeated_slots, repeated_labels, args, True, anchor_ids, evidence_ids)
+            active_mask = rollout["mask"]
             advantage = (
-                args.anchor_coef * fac.group_advantage(result["anchor"], mask, labels.numel(), group)
-                + args.evidence_coef * fac.group_advantage(result["evidence"], mask, labels.numel(), group)
-                + args.pair_coef * fac.group_advantage(result["pair"], mask, labels.numel(), group)
-                + args.rule_margin_coef * fac.group_advantage(result["rule"], mask, labels.numel(), group)
+                args.anchor_coef * fac.group_advantage(rollout["anchor"], active_mask, labels.numel(), group)
+                + args.evidence_coef * fac.group_advantage(rollout["evidence"], active_mask, labels.numel(), group)
+                + args.pair_coef * fac.group_advantage(rollout["pair"], active_mask, labels.numel(), group)
+                + args.class_margin_coef * fac.group_advantage(rollout["class_margin"], active_mask, labels.numel(), group)
             )
-            grpo_loss = -(result["log_probs"] * advantage * mask).sum() / mask.sum().clamp_min(1.0)
+            grpo_loss = -(rollout["log_probs"] * advantage * active_mask).sum() / active_mask.sum().clamp_min(1.0)
             policy_optimizer.zero_grad(set_to_none=True)
             grpo_loss.backward()
             torch.nn.utils.clip_grad_norm_(fac.policy_parameters(model), 1.0)
@@ -183,7 +181,7 @@ def main() -> None:
             correct += class_logits.argmax(1).eq(labels).sum().item()
             for name, value in (
                 ("aux", aux_loss), ("class", class_loss), ("component", component_loss),
-                ("pair_ce", pair_loss), ("grpo", grpo_loss.detach()),
+                ("pair_ce", pair_ce_loss), ("grpo", grpo_loss.detach()),
             ):
                 loss_sums[name] += float(value.detach()) * batch
 
@@ -203,6 +201,8 @@ def main() -> None:
         losses = " ".join(f"{name}={value/max(seen,1):.4f}" for name, value in loss_sums.items())
         print(
             f"epoch={epoch} phase=joint train_acc={100*correct/max(seen,1):.2f} {losses} "
+            f"class_margin_coef={args.class_margin_coef:g} "
+            f"anchor_coef={args.anchor_coef:g} evidence_coef={args.evidence_coef:g} pair_coef={args.pair_coef:g} "
             f"valid_pair_score@3={sums[3]['pair']/valid_total:.4f} "
             f"valid_pair_score@4={sums[4]['pair']/valid_total:.4f} "
             f"valid_pair_hit@3={100*sums[3]['pair_hit']/valid_total:.2f} "

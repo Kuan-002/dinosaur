@@ -184,7 +184,7 @@ def main() -> None:
             metric_keys += [f"{name}@{top_k}/thr{threshold:g}" for name in ("anchor", "evidence", "pair")]
     rows_by_class = defaultdict(list)
     for row in rows:
-        rows_by_class[f"{row['true']}:{row['true_name']}"] .append(row)
+        rows_by_class[f"{row['true']}:{row['true_name']}"].append(row)
     out_dir = Path(args.out_dir) if args.out_dir else run_dir / "bbox_eval_forced_top3_top4"
     out_dir.mkdir(parents=True, exist_ok=True)
     summary = {
