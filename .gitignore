@@ -1,29 +1,90 @@
-# Python cache
+# Keep the public repository deliberately small. Everything at the repository
+# root is private unless it is explicitly allowed below.
+/*
+
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/requirements.txt
+!/datasets.py
+!/misc_utils.py
+!/models.py
+!/ocl_metrics.py
+!/selector_grpo.py
+!/slot_attention.py
+!/train.py
+!/train_grpo_selector.py
+!/train_slot_classifier.py
+!/settransformer/
+!/scripts/
+!/GRPO6-contrastive-pair/
+!/GRPO8-contrastive-pair/
+
+# Minimal dependency closure for the two experiment families.
+/settransformer/*
+!/settransformer/__init__.py
+!/settransformer/model.py
+
+/scripts/*
+!/scripts/evaluate_set_bbox.py
+
+/GRPO6-contrastive-pair/*
+!/GRPO6-contrastive-pair/contrastive_core.py
+!/GRPO6-contrastive-pair/train_ac6_contrastive_pair.py
+!/GRPO6-contrastive-pair/train_grpo6_contrastive_pair.py
+!/GRPO6-contrastive-pair/evaluate_grpo6_contrastive_bbox.py
+
+/GRPO8-contrastive-pair/*
+!/GRPO8-contrastive-pair/contrastive_core.py
+!/GRPO8-contrastive-pair/train_ac8_contrastive_pair.py
+!/GRPO8-contrastive-pair/train_grpo8_contrastive_pair.py
+!/GRPO8-contrastive-pair/evaluate_grpo8_contrastive_bbox.py
+
+# Never publish launchers, environments, data, checkpoints, or generated work.
+*.sh
 __pycache__/
 *.py[cod]
-
-# OS files
 .DS_Store
-
-# Logs
-*.log
-logs/
-
-# Local environments and caches
 .venv/
+venv/
 .cache/
-
-# Training outputs
-checkpoints/
-previews/
-
-# Datasets
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+wandb/
+logs/
+**/logs/
 dataset/
-VOC2012_train_val/
-VOC2012_test/
 datasets/
 data/
-
-doc/
+VOC2012_train_val/
+VOC2012_test/
+checkpoints/
+**/checkpoints/
+outputs/
+**/outputs/
+runs/
+**/runs/
+results/
+**/results/
+previews/
+visualizations/
 analysis/
-attentionmask-bbox/
+doc/
+reports/
+figures/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.zip
+!/COCO-8.zip
+*.tar
+*.tar.gz
+*.tgz
+*.png
+*.jpg
+*.jpeg
+*.pdf
+*.npy
+*.npz

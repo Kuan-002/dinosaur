@@ -1,0 +1,7 @@
+torch==2.10.0
+torchvision==0.25.0
+numpy==2.2.6
+Pillow==11.2.1
+tqdm==4.67.0
+scipy==1.15.3
+torchmetrics==1.0.3
